@@ -38,7 +38,6 @@ const MainTabNavigator = () => {
         tabBarIcon: ({ focused }) => {
           let iconName = '';
           let iconSize = 24;
-          
           switch (route.name) {
             case 'Tasks': iconName = 'check-square'; break;
             case 'Requests': iconName = 'inbox'; break;
@@ -47,18 +46,10 @@ const MainTabNavigator = () => {
             case 'Profile': iconName = 'user'; break;
           }
 
-          // Custom Floating Home Button Logic
           if (route.name === 'Home') {
             return (
               <View style={styles.homeButtonWrapper}>
-                <View style={[
-                  styles.homeButton,
-                  {
-                    backgroundColor: colors.background,
-                    borderWidth: 4,
-                    borderColor: colors.primary,
-                  },
-                ]}>
+                <View style={styles.logoCircle}>
                   <Icon name={iconName} size={30} color={colors.primary} />
                 </View>
               </View>
@@ -95,15 +86,18 @@ const MainTabNavigator = () => {
 const styles = StyleSheet.create({
   homeButtonWrapper: {
     position: 'absolute',
-    top: -25, // Adjusted to sit nicely on the flat bar
+    top: -25,
     alignItems: 'center',
     justifyContent: 'center',
     zIndex: 10,
   },
-  homeButton: {
+  logoCircle: {
     width: 60,
     height: 60,
     borderRadius: 30,
+    backgroundColor: '#fff',
+    borderWidth: 4,
+    borderColor: '#19B300', // Green border
     alignItems: 'center',
     justifyContent: 'center',
     shadowColor: '#000',
@@ -112,6 +106,7 @@ const styles = StyleSheet.create({
     shadowRadius: 4,
     elevation: 5,
   },
+  // logoImage removed
 });
 
 export default MainTabNavigator;
