@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   View, 
   Text, 
@@ -12,9 +12,11 @@ import {
   Platform,
   ScrollView
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useNavigation } from '@react-navigation/native'; // 1. Import Navigation Hook
 import useThemeColors from '../theme/useThemeColors';
 import { useApp } from '../contexts/AppContext';
+import { BASE_URL, getStaffId, VEHICLE_ID } from '../config/env';
 
 const HomeScreen = () => {
   const colors = useThemeColors();
@@ -25,7 +27,21 @@ const HomeScreen = () => {
   const [step, setStep] = useState(1);
   const [engineHours, setEngineHours] = useState('');
   const [fuelRequest, setFuelRequest] = useState('');
-  const [requestDetails, setRequestDetails] = useState(null);
+  type RequestDetails = { id: string; location: string; status: string } | null;
+  const [requestDetails, setRequestDetails] = useState<RequestDetails>(null);
+
+  // Load cached request_id on mount if exists
+  useEffect(() => {
+    const loadCachedRequest = async () => {
+      try {
+        const cached = await AsyncStorage.getItem('CHECKIN_REQUEST_ID');
+        if (cached) {
+          setRequestDetails({ id: cached, location: 'Fuel Station B (North)', status: 'Pending' });
+        }
+      } catch (e) {}
+    };
+    loadCachedRequest();
+  }, []);
 
   const styles = makeStyles(colors);
 
@@ -36,22 +52,43 @@ const HomeScreen = () => {
     }
   };
 
-  const handleFinalSubmit = () => {
-    const randomId = Math.random().toString(36).substring(2, 6).toUpperCase();
-    const location = "Fuel Station B (North)";
+  const handleFinalSubmit = async () => {
+    const payload = {
+      staff_id: getStaffId() || '',
+      intial_engine_hours: parseFloat(engineHours) || 0,
+      fuel_requested: parseFloat(fuelRequest) || 0,
+      timestamp: new Date().toISOString(),
+      location: {}
+    };
 
-    setRequestDetails({
-      id: randomId,
-      location: location,
-      status: 'Pending'
-    });
+    try {
+      const res = await fetch(`${BASE_URL}/admin_staff/check_in`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
 
-    if (parseFloat(fuelRequest) > 0) {
-      Alert.alert("Request Pending", `Fuel request for ${fuelRequest}L sent. Status is now PENDING.`);
+      if (data && data.success && data.request_id) {
+        const locationLabel = 'Fuel Station B (North)';
+        setRequestDetails({ id: data.request_id, location: locationLabel, status: 'Pending' });
+        // Cache request_id
+        try {
+          await AsyncStorage.setItem('CHECKIN_REQUEST_ID', data.request_id);
+        } catch (e) {}
+
+        if (parseFloat(fuelRequest) > 0) {
+          Alert.alert('Request Pending', `Fuel request for ${fuelRequest}L sent. Status is now PENDING.`);
+        }
+
+        setModalVisible(false);
+        checkIn(VEHICLE_ID);
+      } else {
+        Alert.alert('Check-in Failed', 'Server rejected check-in. Please try again.');
+      }
+    } catch (err) {
+      Alert.alert('Network Error', 'Unable to reach server. Please try again.');
     }
-
-    setModalVisible(false);
-    checkIn('TRC-2024-01');
   };
 
   return (
@@ -87,7 +124,7 @@ const HomeScreen = () => {
           imageStyle={{
             borderRadius: 20,
             resizeMode: 'cover',
-            tintColor: isCheckedIn ? null : '#95a5a6',
+            ...(isCheckedIn ? {} : { tintColor: '#95a5a6' }),
           }}
         >
            <View style={styles.cardTopRow}>
@@ -131,7 +168,7 @@ const HomeScreen = () => {
           {/* 3. VIEW ALL TASKS BUTTON - NOW CONNECTED */}
           <TouchableOpacity 
             style={styles.taskButton}
-            onPress={() => navigation.navigate('Tasks')} 
+            onPress={() => navigation.navigate && navigation.navigate('Tasks' as never)}
           >
              <View style={styles.iconCircle}>
                 <Text style={{fontSize: 18, color: '#fff'}}>📋</Text>

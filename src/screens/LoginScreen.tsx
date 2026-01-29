@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { ActivityIndicator } from 'react-native';
 import { useAuth } from '../contexts/AuthContext';
-import { BASE_URL } from '../config/env';
+import { BASE_URL, setStaffId } from '../config/env';
 import {
   View,
   Text,
@@ -31,6 +31,8 @@ const LoginScreen = () => {
       });
       const data = await res.json();
       if (data && data.success && data.staff_id) {
+        // persist staff id in runtime env wrapper for use elsewhere
+        try { setStaffId(data.staff_id); } catch (e) { /* ignore */ }
         // Create minimal user object with only id
         await login({
           id: data.staff_id,

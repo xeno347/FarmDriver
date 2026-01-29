@@ -43,6 +43,7 @@
     "@react-native/typescript-config": "0.83.1",
     "@types/jest": "29.5.14",
     "@types/react": "19.2.10",
+    "@types/react-native-maps": "^0.24.1",
     "@types/react-test-renderer": "19.1.0",
     "concurrently": "9.2.1",
     "eslint": "8.57.1",

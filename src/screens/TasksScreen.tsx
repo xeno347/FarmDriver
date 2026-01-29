@@ -1,109 +1,109 @@
-import React, { useState } from 'react';
-import { 
-  View, 
-  Text, 
-  StyleSheet, 
-  ScrollView, 
-  TouchableOpacity, 
+import React, { useState, useEffect } from 'react';
+import {
+  View,
+  Text,
+  StyleSheet,
+  ScrollView,
+  TouchableOpacity,
   Modal,
   Platform,
-  Dimensions
+  Dimensions,
+  ActivityIndicator,
+  Alert
 } from 'react-native';
-import { WebView } from 'react-native-webview';
+import MapView, { Marker, PROVIDER_GOOGLE, Region } from 'react-native-maps';
+import { BASE_URL, getStaffId } from '../config/env';
 import FeatherIcon from 'react-native-vector-icons/Feather';
+
 const Icon = FeatherIcon;
 
-// --- Types & Data ---
+// --- Types ---
+type Task = {
+  id: number;
+  title: string;
+  status: string;
+  priority: string;
+  location: string;
+  fieldId: string;
+  time: string;
+  vehicle: string;
+  icon: string;
+  coords: [number, number];
+  details: string;
+};
 
-const tasks = [
-  { 
-    id: 1, 
-    title: 'FIELD PLOWING - NORTH SECTION', 
-    status: 'in progress', 
-    priority: 'high', 
-    location: 'North Field A', 
-    fieldId: 'FLD-A01', 
-    time: '08:00 - 12:00', 
-    vehicle: 'TRC-2024-01', 
-    icon: 'tractor', 
-    coords: [28.61, 77.20],
-    details: 'Deep plowing required, 25cm depth.' 
-  },
-  { 
-    id: 2, 
-    title: 'WHEAT HARVESTING', 
-    status: 'pending', 
-    priority: 'high', 
-    location: 'East Field B', 
-    fieldId: 'FLD-B03', 
-    time: '13:00 - 17:00', 
-    vehicle: 'HRV-2024-02', 
-    icon: 'barley', // Wheat icon equivalent
-    coords: [28.62, 77.21],
-    details: 'Harvest wheat in field B03. Ensure moisture check.' 
-  },
-  { 
-    id: 3, 
-    title: 'TRANSPORT TO STORAGE', 
-    status: 'pending', 
-    priority: 'medium', 
-    location: 'Main Warehouse', 
-    fieldId: 'WHS-001', 
-    time: '17:30 - 18:30', 
-    vehicle: 'TIP-2024-03', 
-    icon: 'package-variant-closed', 
-    coords: [28.615, 77.22],
-    details: 'Transport harvested wheat to warehouse WHS-001.' 
-  },
-];
-
-// --- Leaflet Map HTML ---
-const getLeafletHtml = (taskList: typeof tasks) => `
-<!DOCTYPE html>
-<html>
-<head>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <style>
-    body { margin: 0; padding: 0; }
-    #map { width: 100%; height: 100vh; background-color: #f3f4f6; }
-    .custom-icon { border-radius: 50%; border: 2px solid white; box-shadow: 0 2px 4px rgba(0,0,0,0.3); }
-  </style>
-</head>
-<body>
-  <div id="map"></div>
-  <script>
-    var map = L.map('map', { zoomControl: false, attributionControl: false }).setView([28.615, 77.21], 13);
-    
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom: 19,
-    }).addTo(map);
-
-    var tasks = ${JSON.stringify(taskList)};
-    
-    tasks.forEach(function(t) {
-      var color = t.status === 'in progress' ? '#3b82f6' : (t.status === 'done' ? '#10b981' : '#9ca3af');
-      var circle = L.circleMarker(t.coords, {
-        color: 'white',
-        fillColor: color,
-        fillOpacity: 1,
-        radius: 8,
-        weight: 2
-      }).addTo(map);
-    });
-  </script>
-</body>
-</html>
-`;
+// --- API Task Fetching ---
+const mapApiTaskToUiTask = (apiTask: any, idx: number): Task => ({
+  id: idx + 1,
+  title: apiTask.activity || 'Task',
+  status: apiTask.status || 'pending',
+  priority: 'high', // You can map this if available
+  location: apiTask.farm_id || 'Unknown',
+  fieldId: apiTask.plan_id || '',
+  time: apiTask.date || '',
+  vehicle: apiTask.vehicle_number || '',
+  icon: 'truck', // Default icon, change based on activity if needed
+  coords: apiTask.farm_coordinates || [0, 0],
+  details: apiTask.activity || '',
+});
 
 const TasksScreen = () => {
-  const [modalTask, setModalTask] = useState<typeof tasks[0] | null>(null);
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [modalTask, setModalTask] = useState<Task | null>(null);
+  const [userLocation, setUserLocation] = useState<{ latitude: number; longitude: number } | null>(null);
+  const [mapExpanded, setMapExpanded] = useState(false);
+
+  // --- Location Effect with TypeScript Fix ---
+  useEffect(() => {
+    // FIX: Cast globalThis to 'any' to bypass the missing Navigator type definition in React Native
+    const nav = (globalThis as any).navigator;
+
+    if (nav && nav.geolocation) {
+      nav.geolocation.getCurrentPosition(
+        (position: any) => {
+          setUserLocation({
+            latitude: position.coords.latitude,
+            longitude: position.coords.longitude,
+          });
+        },
+        (_error: any) => {
+          console.log('Location error:', _error);
+          setUserLocation(null);
+        },
+        { enableHighAccuracy: true, timeout: 15000, maximumAge: 10000 }
+      );
+    }
+  }, []);
+
+  // --- Data Fetch Effect ---
+  useEffect(() => {
+    const fetchTasks = async () => {
+      setLoading(true);
+      try {
+        const staffId = getStaffId();
+        const res = await fetch(`${BASE_URL}/admin_vehicles/get_all_task/${staffId}`);
+        const data = await res.json();
+        
+        if (data && data.success && Array.isArray(data.pending_tasks)) {
+          setTasks(data.pending_tasks.map(mapApiTaskToUiTask));
+        } else {
+          setTasks([]);
+        }
+      } catch (e) {
+        console.error('Fetch error:', e);
+        setTasks([]);
+      }
+      setLoading(false);
+    };
+    fetchTasks();
+  }, []);
 
   // Helper for colors
   const getStatusColor = (status: string) => status === 'in progress' ? '#3b82f6' : '#6b7280';
+  
   const getPriorityColor = (priority: string) => {
-    switch(priority) {
+    switch(priority.toLowerCase()) {
       case 'high': return '#ef4444'; // Red
       case 'medium': return '#f59e0b'; // Orange
       case 'low': return '#10b981'; // Green
@@ -113,101 +113,147 @@ const TasksScreen = () => {
 
   return (
     <View style={styles.container}>
-      
       {/* HEADER */}
       <View style={styles.headerRow}>
         <Text style={styles.headerTitle}>TASK MANAGER</Text>
         <View>
           <Text style={styles.headerLabel}>DATE</Text>
-          <Text style={styles.headerDate}>Jan 26, 2026</Text>
+          <Text style={styles.headerDate}>{new Date().toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</Text>
         </View>
       </View>
 
-      <ScrollView contentContainerStyle={{ paddingBottom: 40 }} showsVerticalScrollIndicator={false}>
-        <Text style={styles.subHeader}>TODAY'S SCHEDULE</Text>
+      {loading ? (
+        <ActivityIndicator size="large" color="#3b82f6" style={{marginTop: 40}} />
+      ) : (
+        <ScrollView contentContainerStyle={{ paddingBottom: 40 }} showsVerticalScrollIndicator={false}>
+          <Text style={styles.subHeader}>TODAY'S SCHEDULE</Text>
 
-        {/* MAP SECTION (Leaflet) */}
-        <View style={styles.mapContainer}>
-          <View style={styles.mapHeaderOverlay}>
-             <Text style={styles.mapLabel}>FARM OVERVIEW</Text>
-             <View style={styles.legendContainer}>
-               <View style={styles.legendItem}><View style={[styles.dot, {backgroundColor:'#3b82f6'}]}/><Text style={styles.legendText}>Active</Text></View>
-               <View style={styles.legendItem}><View style={[styles.dot, {backgroundColor:'#9ca3af'}]}/><Text style={styles.legendText}>Pending</Text></View>
-               <View style={styles.legendItem}><View style={[styles.dot, {backgroundColor:'#10b981'}]}/><Text style={styles.legendText}>Done</Text></View>
-             </View>
-          </View>
-          <WebView
-            originWhitelist={['*']}
-            source={{ html: getLeafletHtml(tasks) }}
-            style={{ flex: 1 }}
-            scrollEnabled={false}
-          />
-        </View>
-
-        {/* TASK LIST */}
-        {tasks.map((task) => (
-          <TouchableOpacity 
-            key={task.id} 
-            activeOpacity={0.9}
-            style={[
-              styles.taskCard, 
-              task.status === 'in progress' && styles.activeTaskCard
-            ]} 
-            onPress={() => setModalTask(task)}
+          {/* MAP SECTION */}
+          <TouchableOpacity
+            activeOpacity={0.95}
+            onPress={() => setMapExpanded(true)}
+            style={[styles.mapContainer, mapExpanded && styles.mapContainerExpanded]}
           >
-            {/* Top Row: Icon + Title + Priority */}
-            <View style={styles.cardHeader}>
-              <View style={[
-                styles.iconBox, 
-                task.status === 'in progress' ? { backgroundColor: '#dbeafe' } : { backgroundColor: '#f3f4f6' }
-              ]}>
-                <Icon 
-                  name={task.icon} 
-                  size={24} 
-                  color={task.status === 'in progress' ? '#2563eb' : '#4b5563'} 
+            <View style={styles.mapHeaderOverlay} pointerEvents="box-none">
+              <Text style={styles.mapLabel}>FARM OVERVIEW</Text>
+              <View style={styles.legendContainer}>
+                <View style={styles.legendItem}><View style={[styles.dot, {backgroundColor:'#3b82f6'}]}/><Text style={styles.legendText}>Active</Text></View>
+                <View style={styles.legendItem}><View style={[styles.dot, {backgroundColor:'#9ca3af'}]}/><Text style={styles.legendText}>Pending</Text></View>
+                <View style={styles.legendItem}><View style={[styles.dot, {backgroundColor:'#10b981'}]}/><Text style={styles.legendText}>Done</Text></View>
+              </View>
+            </View>
+            
+            <MapView
+              provider={PROVIDER_GOOGLE}
+              style={{ flex: 1, minHeight: mapExpanded ? 400 : 180 }}
+              showsUserLocation={!!userLocation}
+              initialRegion={userLocation ? {
+                latitude: userLocation.latitude,
+                longitude: userLocation.longitude,
+                latitudeDelta: 0.1,
+                longitudeDelta: 0.1,
+              } : {
+                latitude: 22.57297759381728,
+                longitude: 78.96195888519289,
+                latitudeDelta: 10,
+                longitudeDelta: 10,
+              }}
+            >
+              {userLocation && (
+                <Marker
+                  coordinate={userLocation}
+                  title="You are here"
+                  pinColor="#2563eb"
                 />
+              )}
+              {tasks.map((task, idx) => (
+                task.coords && task.coords.length === 2 && task.coords[0] !== 0 ? (
+                  <Marker
+                    key={idx}
+                    coordinate={{ latitude: task.coords[0], longitude: task.coords[1] }}
+                    title={task.title}
+                    description={task.location}
+                    pinColor={task.status === 'in progress' ? '#3b82f6' : (task.status === 'done' ? '#10b981' : '#9ca3af')}
+                  />
+                ) : null
+              ))}
+            </MapView>
+            
+            {mapExpanded && (
+              <TouchableOpacity
+                style={{ position: 'absolute', top: 10, right: 10, backgroundColor: '#fff', borderRadius: 20, padding: 8, zIndex: 20 }}
+                onPress={() => setMapExpanded(false)}
+              >
+                <FeatherIcon name="x" size={24} color="#6b7280" />
+              </TouchableOpacity>
+            )}
+          </TouchableOpacity>
+
+          {/* TASK LIST */}
+          {tasks.length === 0 && (
+            <Text style={{textAlign:'center', color:'#6B7280', marginTop: 24}}>No tasks found for today.</Text>
+          )}
+          
+          {tasks.map((task) => (
+            <TouchableOpacity 
+              key={task.id} 
+              activeOpacity={0.9}
+              style={[
+                styles.taskCard, 
+                task.status === 'in progress' && styles.activeTaskCard
+              ]} 
+              onPress={() => setModalTask(task)}
+            >
+              {/* Top Row: Icon + Title + Priority */}
+              <View style={styles.cardHeader}>
+                <View style={[
+                  styles.iconBox, 
+                  task.status === 'in progress' ? { backgroundColor: '#dbeafe' } : { backgroundColor: '#f3f4f6' }
+                ]}>
+                  <Icon 
+                    name={task.icon} 
+                    size={24} 
+                    color={task.status === 'in progress' ? '#2563eb' : '#4b5563'} 
+                  />
+                </View>
+                <View style={styles.titleContainer}>
+                  <Text style={styles.taskTitle}>{task.title}</Text>
+                  <Text style={styles.taskSubLoc}>
+                    <FeatherIcon name="map-pin" size={10} /> {task.location} • {task.fieldId}
+                  </Text>
+                </View>
+                <View style={styles.rightHeader}>
+                  <View style={[styles.priorityDot, { backgroundColor: getPriorityColor(task.priority) }]} />
+                  <FeatherIcon name="chevron-right" size={20} color="#9ca3af" />
+                </View>
               </View>
               
-              <View style={styles.titleContainer}>
-                <Text style={styles.taskTitle}>{task.title}</Text>
-                <Text style={styles.taskSubLoc}>
-                   <FeatherIcon name="map-pin" size={10} /> {task.location} • {task.fieldId}
+              <View style={styles.divider} />
+              
+              {/* Bottom Row: Status, Time, Vehicle */}
+              <View style={styles.cardFooter}>
+                <View style={styles.footerItem}>
+                  {task.status === 'in progress' ? (
+                    <Icon name="clock" size={14} color="#3b82f6" style={{marginRight:4}} />
+                  ) : (
+                    <FeatherIcon name="circle" size={14} color="#9ca3af" style={{marginRight:4}} />
+                  )}
+                  <Text style={[styles.footerText, { color: getStatusColor(task.status), fontWeight: '700', textTransform: 'uppercase' }]}> 
+                    {task.status}
+                  </Text>
+                </View>
+                <View style={styles.footerItem}>
+                  <FeatherIcon name="clock" size={14} color="#6b7280" style={{marginRight:4}} />
+                  <Text style={styles.footerText}>{task.time}</Text>
+                </View>
+                <Text style={[styles.footerText, { marginLeft: 'auto', fontWeight: '500' }]}>
+                  {task.vehicle}
                 </Text>
               </View>
-
-              <View style={styles.rightHeader}>
-                <View style={[styles.priorityDot, { backgroundColor: getPriorityColor(task.priority) }]} />
-                <FeatherIcon name="chevron-right" size={20} color="#9ca3af" />
-              </View>
-            </View>
-
-            <View style={styles.divider} />
-
-            {/* Bottom Row: Status, Time, Vehicle */}
-            <View style={styles.cardFooter}>
-              <View style={styles.footerItem}>
-                {task.status === 'in progress' ? (
-                   <Icon name="progress-clock" size={14} color="#3b82f6" style={{marginRight:4}} />
-                ) : (
-                   <FeatherIcon name="circle" size={14} color="#9ca3af" style={{marginRight:4}} />
-                )}
-                <Text style={[styles.footerText, { color: getStatusColor(task.status), fontWeight: '700', textTransform: 'uppercase' }]}>
-                  {task.status}
-                </Text>
-              </View>
-
-              <View style={styles.footerItem}>
-                <FeatherIcon name="clock" size={14} color="#6b7280" style={{marginRight:4}} />
-                <Text style={styles.footerText}>{task.time}</Text>
-              </View>
-
-              <Text style={[styles.footerText, { marginLeft: 'auto', fontWeight: '500' }]}>
-                {task.vehicle}
-              </Text>
-            </View>
-          </TouchableOpacity>
-        ))}
-      </ScrollView>
+            </TouchableOpacity>
+          ))}
+        </ScrollView>
+      )}
 
       {/* CUSTOM DETAILS MODAL */}
       <Modal
@@ -218,18 +264,14 @@ const TasksScreen = () => {
       >
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
-            
-            {/* Modal Header */}
             <View style={styles.modalHeaderRow}>
               <Text style={styles.modalTitle}>TASK DETAILS</Text>
               <TouchableOpacity onPress={() => setModalTask(null)}>
                 <FeatherIcon name="x" size={24} color="#6b7280" />
               </TouchableOpacity>
             </View>
-
             {modalTask && (
               <>
-                {/* Header Card inside Modal */}
                 <View style={styles.modalTopCard}>
                   <View style={styles.modalIconBox}>
                     <Icon name={modalTask.icon} size={24} color="#1e3a8a" />
@@ -240,46 +282,43 @@ const TasksScreen = () => {
                   </View>
                 </View>
 
-                {/* Details List */}
                 <View style={styles.detailRow}>
-                   <Text style={styles.detailLabel}>LOCATION</Text>
-                   <Text style={styles.detailValue}>{modalTask.location}</Text>
+                  <Text style={styles.detailLabel}>LOCATION</Text>
+                  <Text style={styles.detailValue}>{modalTask.location}</Text>
                 </View>
                 <View style={styles.detailRow}>
-                   <Text style={styles.detailLabel}>FIELD ID</Text>
-                   <Text style={styles.detailValue}>{modalTask.fieldId}</Text>
+                  <Text style={styles.detailLabel}>FIELD ID</Text>
+                  <Text style={styles.detailValue}>{modalTask.fieldId}</Text>
                 </View>
                 <View style={styles.detailRow}>
-                   <Text style={styles.detailLabel}>TIME</Text>
-                   <Text style={styles.detailValue}>{modalTask.time}</Text>
+                  <Text style={styles.detailLabel}>TIME</Text>
+                  <Text style={styles.detailValue}>{modalTask.time}</Text>
                 </View>
                 <View style={styles.detailRow}>
-                   <Text style={styles.detailLabel}>VEHICLE</Text>
-                   <Text style={styles.detailValue}>{modalTask.vehicle}</Text>
+                  <Text style={styles.detailLabel}>VEHICLE</Text>
+                  <Text style={styles.detailValue}>{modalTask.vehicle}</Text>
                 </View>
                 <View style={styles.detailRow}>
-                   <Text style={styles.detailLabel}>STATUS</Text>
-                   <View style={[styles.statusBadge, { backgroundColor: modalTask.status === 'in progress' ? '#dbeafe' : '#f3f4f6' }]}>
-                      <Text style={[styles.statusBadgeText, { color: modalTask.status === 'in progress' ? '#2563eb' : '#4b5563' }]}>
-                        {modalTask.status.toUpperCase()}
-                      </Text>
-                   </View>
+                  <Text style={styles.detailLabel}>STATUS</Text>
+                  <View style={[styles.statusBadge, { backgroundColor: modalTask.status === 'in progress' ? '#dbeafe' : '#f3f4f6' }]}> 
+                    <Text style={[styles.statusBadgeText, { color: modalTask.status === 'in progress' ? '#2563eb' : '#4b5563' }]}> 
+                      {modalTask.status.toUpperCase()}
+                    </Text>
+                  </View>
                 </View>
                 <View style={styles.detailRow}>
-                   <Text style={styles.detailLabel}>PRIORITY</Text>
-                   <View style={{flexDirection:'row', alignItems:'center'}}>
-                      <View style={[styles.priorityDot, { backgroundColor: getPriorityColor(modalTask.priority), marginRight: 6 }]} />
-                      <Text style={styles.detailValue}>{modalTask.priority.charAt(0).toUpperCase() + modalTask.priority.slice(1)}</Text>
-                   </View>
+                  <Text style={styles.detailLabel}>PRIORITY</Text>
+                  <View style={{flexDirection:'row', alignItems:'center'}}>
+                    <View style={[styles.priorityDot, { backgroundColor: getPriorityColor(modalTask.priority), marginRight: 6 }]} />
+                    <Text style={styles.detailValue}>{modalTask.priority.charAt(0).toUpperCase() + modalTask.priority.slice(1)}</Text>
+                  </View>
                 </View>
 
-                {/* Instructions */}
                 <View style={styles.instructionBox}>
                   <Text style={styles.detailLabel}>INSTRUCTIONS</Text>
                   <Text style={styles.instructionText}>{modalTask.details}</Text>
                 </View>
 
-                {/* Action Button */}
                 <TouchableOpacity style={styles.completeButton} onPress={() => setModalTask(null)}>
                   <Text style={styles.completeButtonText}>COMPLETE TASK</Text>
                 </TouchableOpacity>
@@ -288,7 +327,6 @@ const TasksScreen = () => {
           </View>
         </View>
       </Modal>
-
     </View>
   );
 };
@@ -305,6 +343,7 @@ const styles = StyleSheet.create({
 
   // Map
   mapContainer: { height: 180, marginHorizontal: 20, marginBottom: 20, borderRadius: 16, overflow: 'hidden', borderWidth: 1, borderColor: '#E5E7EB' },
+  mapContainerExpanded: { height: 400, zIndex: 100, position: 'absolute', top: 60, left: 0, right: 0, marginHorizontal: 0, marginBottom: 0, borderRadius: 0 },
   mapHeaderOverlay: { 
     position: 'absolute', top: 12, left: 12, right: 12, zIndex: 10, 
     flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
