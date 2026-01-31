@@ -20,7 +20,7 @@ import { BASE_URL, getStaffId, VEHICLE_ID } from '../config/env';
 
 const HomeScreen = () => {
   const colors = useThemeColors();
-  const { isCheckedIn, checkIn } = useApp();
+  const { isCheckedIn, checkIn, checkOut } = useApp();
   const navigation = useNavigation(); // 2. Initialize Navigation
   
   const [modalVisible, setModalVisible] = useState(false);
@@ -45,11 +45,20 @@ const HomeScreen = () => {
 
   const styles = makeStyles(colors);
 
-  const handleTractorPress = () => {
+  const handleTractorPress = async () => {
     if (!isCheckedIn) {
       setStep(1);
       setModalVisible(true);
+      return;
     }
+
+    // If already checked in -> perform checkout
+    try {
+      await AsyncStorage.removeItem('CHECKIN_REQUEST_ID');
+    } catch (e) {}
+    setRequestDetails(null);
+    checkOut();
+    Alert.alert('Checked Out', 'You have been checked out.');
   };
 
   const handleFinalSubmit = async () => {
