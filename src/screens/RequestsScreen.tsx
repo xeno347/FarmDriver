@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { 
   View, 
   Text, 
@@ -8,15 +8,19 @@ import {
   TextInput,
   Modal,
   Switch,
-  Alert
+  Alert,
+  ActivityIndicator
 } from 'react-native';
 // import { WebView } from 'react-native-webview'; // Commented out for safety
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import Icon from 'react-native-vector-icons/Feather';
 import MaterialIcon from 'react-native-vector-icons/MaterialCommunityIcons';
+import { BASE_URL, getStaffId } from '../config/env';
+import { useAuth } from '../contexts/AuthContext';
 
 // --- Types ---
 type Request = {
-  id: number;
+  id: string | number;
   type: 'fuel' | 'logistics';
   status: 'pending' | 'approved' | 'done';
   title: string;
@@ -74,6 +78,271 @@ const RequestsScreen = () => {
   const [requests, setRequests] = useState(initialRequests);
   const [showNewModal, setShowNewModal] = useState(false);
   const [selectedRequest, setSelectedRequest] = useState<Request | null>(null);
+  const [syncing, setSyncing] = useState(false);
+  const { user } = useAuth();
+  const [cachedStaffId, setCachedStaffId] = useState<string>('');
+  const staffIdRef = useRef<string>('');
+  const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectAttemptRef = useRef(0);
+
+  const markDelivered = (requestId: Request['id']) => {
+    setRequests((prev) =>
+      prev.map((r) =>
+        String(r.id) === String(requestId)
+          ? {
+              ...r,
+              status: 'done',
+              colorBg: '#ECFDF5',
+              borderColor: '#6EE7B7',
+            }
+          : r
+      )
+    );
+
+    setSelectedRequest((prev) =>
+      prev && String(prev.id) === String(requestId)
+        ? {
+            ...prev,
+            status: 'done',
+            colorBg: '#ECFDF5',
+            borderColor: '#6EE7B7',
+          }
+        : prev
+    );
+  };
+
+  const stats = useMemo(() => {
+    return {
+      pending: requests.filter(r => r.status === 'pending').length,
+      approved: requests.filter(r => r.status === 'approved').length,
+      done: requests.filter(r => r.status === 'done').length,
+    };
+  }, [requests]);
+
+  const normalizeStatus = (status: unknown): Request['status'] => {
+    const s = String(status ?? '').trim().toLowerCase();
+    if (s === 'approved') return 'approved';
+    if (s === 'done' || s === 'completed' || s === 'complete') return 'done';
+    return 'pending';
+  };
+
+  const isLogisticsRequestActivity = (activity: unknown) => {
+    const a = String(activity ?? '').trim().toLowerCase();
+    return a === 'logistics request' || a === 'logistics';
+  };
+
+  const parseLogisticsLocation = (farmId: unknown) => {
+    const raw = String(farmId ?? '').trim();
+    // Example: "Pickup -> Delivery"
+    if (raw.includes('->')) {
+      const parts = raw.split('->').map(p => p.trim()).filter(Boolean);
+      return parts[parts.length - 1] || raw;
+    }
+    return raw;
+  };
+
+  const buildWebSocketUrl = (baseUrl: string, path: string) => {
+    const trimmedBase = String(baseUrl ?? '').trim().replace(/\/+$/, '');
+    const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+    const httpUrl = `${trimmedBase}${normalizedPath}`;
+    if (httpUrl.startsWith('wss://') || httpUrl.startsWith('ws://')) return httpUrl;
+    if (httpUrl.startsWith('https://')) return httpUrl.replace(/^https:\/\//, 'wss://');
+    if (httpUrl.startsWith('http://')) return httpUrl.replace(/^http:\/\//, 'ws://');
+    // Fallback: assume secure
+    return `wss://${httpUrl.replace(/^\/+/, '')}`;
+  };
+
+  const upsertIncomingLogisticsRequest = (payload: any) => {
+    const planId = String(payload?.plan_id ?? payload?.data?.plan_id ?? '');
+    const data = payload?.data ?? payload;
+    const entry = data?.plan_entry ?? {};
+    const id = planId || `${data?.vehicle_id ?? ''}_${data?.date ?? ''}_${entry?.requested_location ?? ''}`;
+
+    const newReq: Request = {
+      id,
+      type: 'logistics',
+      status: normalizeStatus(entry?.status ?? data?.status),
+      title: 'LOGISTICS REQUEST',
+      reqId: planId || undefined,
+      note: [
+        entry?.staff_name ? `Name: ${entry.staff_name}` : null,
+        entry?.staff_contact ? `Contact: ${entry.staff_contact}` : null,
+        entry?.request ? `Request: ${entry.request}` : null,
+      ].filter(Boolean).join('\n') || (entry?.request ? String(entry.request) : undefined),
+      location: parseLogisticsLocation(entry?.requested_location ?? data?.farm_id) || 'Unknown',
+      date: data?.date ? String(data.date) : undefined,
+      time: undefined,
+      colorBg: '#FFFFFF',
+      borderColor: '#E5E7EB',
+    };
+
+    setRequests((prev) => {
+      const existingIndex = prev.findIndex((r) => String(r.id) === String(newReq.id));
+      if (existingIndex >= 0) {
+        const copy = [...prev];
+        copy[existingIndex] = { ...copy[existingIndex], ...newReq };
+        return copy;
+      }
+      return [newReq, ...prev];
+    });
+  };
+
+  // Resolve staff id used for websocket filtering
+  useEffect(() => {
+    let isMounted = true;
+    (async () => {
+      try {
+        const stored = await AsyncStorage.getItem('STAFF_ID');
+        if (isMounted && stored) setCachedStaffId(stored);
+      } catch {
+        // ignore
+      }
+    })();
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    staffIdRef.current = String(user?.id || getStaffId() || cachedStaffId || '').trim();
+  }, [user?.id, cachedStaffId]);
+
+  useEffect(() => {
+    const syncLogisticsFromTasksApi = async () => {
+      const staffId = getStaffId();
+      if (!staffId) return;
+
+      setSyncing(true);
+      try {
+        const res = await fetch(`${BASE_URL}/admin_vehicles/get_all_task/${encodeURIComponent(staffId)}`);
+        const data = await res.json();
+        const pendingTasks: any[] = Array.isArray(data?.pending_tasks) ? data.pending_tasks : [];
+        const logisticsPending = pendingTasks.filter((t: any) => isLogisticsRequestActivity(t?.activity));
+
+        const mapped: Request[] = logisticsPending.map((t: any) => {
+          const planId = String(t?.plan_id ?? '');
+          return {
+            id: planId || `${t?.vehicle_id ?? ''}_${t?.date ?? ''}_${t?.farm_id ?? ''}`,
+            type: 'logistics',
+            status: normalizeStatus(t?.status),
+            title: 'LOGISTICS REQUEST',
+            reqId: planId || undefined,
+            note: t?.farm_id ? String(t.farm_id) : undefined,
+            location: parseLogisticsLocation(t?.farm_id) || 'Unknown',
+            date: t?.date ? String(t.date) : undefined,
+            time: undefined,
+            colorBg: '#FFFFFF',
+            borderColor: '#E5E7EB',
+          };
+        });
+
+        // Merge without duplicates (by id)
+        setRequests((prev) => {
+          const seen = new Set(prev.map((r) => String(r.id)));
+          const toAdd = mapped.filter((r) => !seen.has(String(r.id)));
+          return toAdd.length ? [...toAdd, ...prev] : prev;
+        });
+      } catch (e) {
+        // Avoid noisy alerts here; screen can still work with manual requests.
+        console.log('Requests sync error:', e);
+      } finally {
+        setSyncing(false);
+      }
+    };
+
+    syncLogisticsFromTasksApi();
+  }, []);
+
+  // WebSocket: listen for logistics request events and show them in realtime
+  useEffect(() => {
+    const wsUrl = buildWebSocketUrl(BASE_URL, '/ws/logistics');
+
+    const cleanupTimers = () => {
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+    };
+
+    const disconnect = () => {
+      cleanupTimers();
+      try {
+        wsRef.current?.close();
+      } catch {
+        // ignore
+      }
+      wsRef.current = null;
+    };
+
+    const scheduleReconnect = () => {
+      cleanupTimers();
+      const attempt = reconnectAttemptRef.current;
+      // exponential backoff: 0.5s, 1s, 2s, 4s ... max 15s
+      const delay = Math.min(15000, 500 * Math.pow(2, attempt));
+      reconnectAttemptRef.current = Math.min(attempt + 1, 10);
+      reconnectTimerRef.current = setTimeout(() => {
+        connect();
+      }, delay);
+    };
+
+    const onMessage = (event: WebSocketMessageEvent) => {
+      try {
+        console.log('[ws/logistics] message:', event.data);
+        const msg = JSON.parse(String(event.data ?? '{}'));
+        if (msg?.event !== 'LOGISTICS_REQUEST_CREATED') return;
+
+        const incomingStaffId = String(msg?.data?.staff_id ?? '').trim();
+        const currentStaffId = String(staffIdRef.current ?? '').trim();
+        if (!incomingStaffId || !currentStaffId) return;
+        if (incomingStaffId !== currentStaffId) return;
+
+        upsertIncomingLogisticsRequest(msg);
+      } catch (e) {
+        console.log('[ws/logistics] message parse error:', e);
+        // ignore invalid payloads
+      }
+    };
+
+    const connect = () => {
+      // avoid duplicate connections
+      if (wsRef.current && (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)) {
+        return;
+      }
+
+      try {
+        const ws = new WebSocket(wsUrl);
+        wsRef.current = ws;
+
+        ws.onopen = () => {
+          reconnectAttemptRef.current = 0;
+        };
+
+        ws.onmessage = onMessage;
+
+        ws.onerror = () => {
+          // Some platforms fire onerror before onclose.
+        };
+
+        ws.onclose = () => {
+          // Reconnect only if user is logged in / staffId known
+          const currentStaffId = String(staffIdRef.current ?? '').trim();
+          if (!currentStaffId) return;
+          scheduleReconnect();
+        };
+      } catch {
+        scheduleReconnect();
+      }
+    };
+
+    connect();
+
+    return () => {
+      disconnect();
+    };
+    // Intentionally do not depend on staffId; we filter messages instead.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Form State
   const [requestType, setRequestType] = useState<'fuel'|'logistics'>('fuel');
@@ -138,17 +407,28 @@ const RequestsScreen = () => {
       <View style={styles.statusRow}>
         <View style={[styles.statusCard, styles.cardPending]}> 
           <Text style={styles.statusLabel}>PENDING</Text>
-          <Text style={[styles.statusValue, { color: '#1F2937' }]}>{requests.filter(r => r.status === 'pending').length}</Text>
+          <Text style={[styles.statusValue, { color: '#1F2937' }]}>{stats.pending}</Text>
         </View>
         <View style={[styles.statusCard, styles.cardApproved]}> 
           <Text style={[styles.statusLabel, {color: '#1E40AF'}]}>APPROVED</Text>
-          <Text style={[styles.statusValue, { color: '#1E40AF' }]}>{requests.filter(r => r.status === 'approved').length}</Text>
+          <Text style={[styles.statusValue, { color: '#1E40AF' }]}>{stats.approved}</Text>
         </View>
         <View style={[styles.statusCard, styles.cardDone]}> 
           <Text style={[styles.statusLabel, {color: '#065F46'}]}>DONE</Text>
-          <Text style={[styles.statusValue, { color: '#065F46' }]}>1</Text>
+          <Text style={[styles.statusValue, { color: '#065F46' }]}>{stats.done}</Text>
         </View>
       </View>
+
+      {syncing && (
+        <View style={{ paddingHorizontal: 20, marginTop: 8 }}>
+          <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+            <ActivityIndicator size="small" color="#6B7280" />
+            <Text style={{ marginLeft: 10, color: '#6B7280', fontWeight: '600' }}>
+              Syncing logistics requests...
+            </Text>
+          </View>
+        </View>
+      )}
 
       {/* LIST */}
       <ScrollView contentContainerStyle={{ paddingBottom: 40, paddingHorizontal: 20 }}>
@@ -196,6 +476,20 @@ const RequestsScreen = () => {
                   </View>
                 </View>
               )}
+
+              <View style={styles.cardActionsRow}>
+                <TouchableOpacity
+                  activeOpacity={0.85}
+                  onPress={() => markDelivered(req.id)}
+                  disabled={req.status === 'done'}
+                  style={[styles.deliveredBtn, req.status === 'done' && styles.deliveredBtnDisabled]}
+                >
+                  <Icon name="check-circle" size={16} color="#fff" style={{ marginRight: 8 }} />
+                  <Text style={styles.deliveredBtnText}>
+                    {req.status === 'done' ? 'DELIVERED' : 'MARK DELIVERED'}
+                  </Text>
+                </TouchableOpacity>
+              </View>
             </TouchableOpacity>
           );
         })}
@@ -227,7 +521,7 @@ const RequestsScreen = () => {
                   onPress={() => setRequestType('logistics')}
                 >
                   <Icon name="package" size={18} color={requestType === 'logistics' ? '#7C3AED' : '#9CA3AF'} />
-                  <Text style={[styles.typeBtnText, requestType === 'logistics' && {color:'#7C3AED'}]}>LOGISTICS</Text>
+                  <Text style={[styles.typeBtnText, requestType === 'logistics' && {color:'#7C3AED'}]}>OTHERS</Text>
                 </TouchableOpacity>
               </View>
 
@@ -378,6 +672,16 @@ const RequestsScreen = () => {
                   </View>
                 </View>
                 <View style={styles.modalActionRow}>
+                  <TouchableOpacity
+                    style={[styles.deliveredBtnModal, selectedRequest.status === 'done' && styles.deliveredBtnDisabled]}
+                    onPress={() => markDelivered(selectedRequest.id)}
+                    disabled={selectedRequest.status === 'done'}
+                  >
+                    <Icon name="check-circle" size={18} color="#fff" style={{marginRight: 6}} />
+                    <Text style={styles.actionBtnText}>
+                      {selectedRequest.status === 'done' ? 'DELIVERED' : 'MARK DELIVERED'}
+                    </Text>
+                  </TouchableOpacity>
                   <TouchableOpacity style={styles.denyBtn} onPress={() => setSelectedRequest(null)}>
                      <Icon name="x-circle" size={18} color="#fff" style={{marginRight: 6}} />
                      <Text style={styles.actionBtnText}>CANCEL REQUEST</Text>
@@ -451,6 +755,11 @@ const styles = StyleSheet.create({
   statusBadge: { backgroundColor: '#F3F4F6', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 4 },
   statusBadgeText: { fontSize: 12, fontWeight: '800', color: '#4B5563' },
   modalActionRow: { flexDirection: 'row', marginTop: 24 },
+  cardActionsRow: { flexDirection: 'row', marginTop: 14 },
+  deliveredBtn: { flex: 1, flexDirection: 'row', backgroundColor: '#16A34A', paddingVertical: 12, borderRadius: 10, alignItems: 'center', justifyContent: 'center' },
+  deliveredBtnModal: { flex: 1, flexDirection: 'row', backgroundColor: '#16A34A', paddingVertical: 14, borderRadius: 8, marginRight: 8, alignItems: 'center', justifyContent: 'center' },
+  deliveredBtnDisabled: { opacity: 0.55 },
+  deliveredBtnText: { color: '#fff', fontWeight: '900', fontSize: 13, letterSpacing: 0.4 },
   denyBtn: { flex: 1, flexDirection: 'row', backgroundColor: '#DC2626', paddingVertical: 14, borderRadius: 8, marginRight: 8, alignItems: 'center', justifyContent: 'center' },
   actionBtnText: { color: '#fff', fontWeight: '800', fontSize: 14 }
 });

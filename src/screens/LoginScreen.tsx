@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { ActivityIndicator } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useAuth } from '../contexts/AuthContext';
 import { BASE_URL, setStaffId } from '../config/env';
 import {
@@ -33,6 +34,8 @@ const LoginScreen = () => {
       if (data && data.success && data.staff_id) {
         // persist staff id in runtime env wrapper for use elsewhere
         try { setStaffId(data.staff_id); } catch (e) { /* ignore */ }
+        // persist staff id across reloads (used by websocket filtering, etc.)
+        try { await AsyncStorage.setItem('STAFF_ID', String(data.staff_id)); } catch (e) { /* ignore */ }
         // Create minimal user object with only id
         await login({
           id: data.staff_id,

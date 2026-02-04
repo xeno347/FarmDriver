@@ -33,6 +33,28 @@ type Task = {
 };
 
 // --- API Task Fetching ---
+const normalizeCoords = (value: any): [number, number] => {
+  // Accept: [lat, lng], { latitude, longitude }, { lat, lng }, "lat,lng"
+  if (Array.isArray(value) && value.length >= 2) {
+    const lat = Number(value[0]);
+    const lng = Number(value[1]);
+    return Number.isFinite(lat) && Number.isFinite(lng) ? [lat, lng] : [0, 0];
+  }
+
+  if (value && typeof value === 'object') {
+    const lat = Number((value.latitude ?? value.lat) as any);
+    const lng = Number((value.longitude ?? value.lng) as any);
+    return Number.isFinite(lat) && Number.isFinite(lng) ? [lat, lng] : [0, 0];
+  }
+
+  if (typeof value === 'string' && value.includes(',')) {
+    const [a, b] = value.split(',').map((x) => Number(x.trim()));
+    return Number.isFinite(a) && Number.isFinite(b) ? [a, b] : [0, 0];
+  }
+
+  return [0, 0];
+};
+
 const mapApiTaskToUiTask = (apiTask: any, idx: number): Task => ({
   id: idx + 1,
   title: apiTask.activity || 'Task',
@@ -43,9 +65,35 @@ const mapApiTaskToUiTask = (apiTask: any, idx: number): Task => ({
   time: apiTask.date || '',
   vehicle: apiTask.vehicle_number || '',
   icon: 'truck', // Default icon, change based on activity if needed
-  coords: apiTask.farm_coordinates || [0, 0],
+  coords: normalizeCoords(apiTask.farm_coordinates),
   details: apiTask.activity || '',
 });
+
+const extractApiTasksArray = (data: any): any[] => {
+  if (!data || typeof data !== 'object') return [];
+  // Common shapes we may get back from backend
+  const candidates = [
+    data.pending_tasks,
+    data.tasks,
+    data.all_tasks,
+    data.data,
+  ];
+  for (const c of candidates) {
+    if (Array.isArray(c)) return c;
+  }
+  return [];
+};
+
+const isPendingStatus = (status: unknown) => {
+  const s = String(status ?? '').trim().toLowerCase();
+  // include a couple of variants seen in APIs
+  return s === 'pending' || s === 'new' || s === 'open';
+};
+
+const isLogisticsRequestActivity = (activity: unknown) => {
+  const a = String(activity ?? '').trim().toLowerCase();
+  return a === 'logistics request' || a === 'logistics';
+};
 
 const TasksScreen = () => {
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -82,19 +130,35 @@ const TasksScreen = () => {
       setLoading(true);
       try {
         const staffId = getStaffId();
-        const res = await fetch(`${BASE_URL}/admin_vehicles/get_all_task/${staffId}`);
-        const data = await res.json();
-        
-        if (data && data.success && Array.isArray(data.pending_tasks)) {
-          setTasks(data.pending_tasks.map(mapApiTaskToUiTask));
-        } else {
+        if (!staffId) {
           setTasks([]);
+          Alert.alert('Missing Staff ID', 'Please login again and retry.');
+          return;
         }
+
+        const res = await fetch(`${BASE_URL}/admin_vehicles/get_all_task/${encodeURIComponent(staffId)}`);
+        const data = await res.json();
+
+        // Show ALL pending tasks (no client-side date filtering)
+        let pendingApiTasks: any[] = [];
+        if (Array.isArray(data?.pending_tasks)) {
+          // Backend already scoped to pending; don't over-filter.
+          pendingApiTasks = data.pending_tasks;
+        } else {
+          const raw = extractApiTasksArray(data);
+          pendingApiTasks = raw.filter((t: any) => isPendingStatus(t?.status));
+        }
+
+        // Move "Logistics Request" into Requests tab instead of Tasks tab.
+        const taskApiTasks = pendingApiTasks.filter((t: any) => !isLogisticsRequestActivity(t?.activity));
+        setTasks(taskApiTasks.map(mapApiTaskToUiTask));
       } catch (e) {
         console.error('Fetch error:', e);
         setTasks([]);
+        Alert.alert('Error', 'Unable to load tasks. Please try again.');
+      } finally {
+        setLoading(false);
       }
-      setLoading(false);
     };
     fetchTasks();
   }, []);
@@ -126,7 +190,7 @@ const TasksScreen = () => {
         <ActivityIndicator size="large" color="#3b82f6" style={{marginTop: 40}} />
       ) : (
         <ScrollView contentContainerStyle={{ paddingBottom: 40 }} showsVerticalScrollIndicator={false}>
-          <Text style={styles.subHeader}>TODAY'S SCHEDULE</Text>
+          <Text style={styles.subHeader}>PENDING TASKS</Text>
 
           {/* MAP SECTION */}
           <TouchableOpacity
@@ -191,7 +255,7 @@ const TasksScreen = () => {
 
           {/* TASK LIST */}
           {tasks.length === 0 && (
-            <Text style={{textAlign:'center', color:'#6B7280', marginTop: 24}}>No tasks found for today.</Text>
+            <Text style={{textAlign:'center', color:'#6B7280', marginTop: 24}}>No pending tasks found.</Text>
           )}
           
           {tasks.map((task) => (

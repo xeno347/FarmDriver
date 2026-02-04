@@ -12,16 +12,30 @@ export const ThemeProvider = ({ children }: { children: ReactNode }) => {
   const [isDarkMode, setIsDarkMode] = useState(false);
 
   useEffect(() => {
+    let isMounted = true;
     (async () => {
-      const stored = await AsyncStorage.getItem('theme');
-      if (stored === 'dark') setIsDarkMode(true);
+      try {
+        const stored = await AsyncStorage.getItem('theme');
+        if (isMounted && stored === 'dark') setIsDarkMode(true);
+      } catch {
+        // If AsyncStorage isn't available (mislinked) or fails, fall back to default.
+      }
     })();
+    return () => {
+      isMounted = false;
+    };
   }, []);
 
   const toggleTheme = async () => {
     setIsDarkMode((prev) => {
       const next = !prev;
-      AsyncStorage.setItem('theme', next ? 'dark' : 'light');
+      (async () => {
+        try {
+          await AsyncStorage.setItem('theme', next ? 'dark' : 'light');
+        } catch {
+          // Ignore persistence errors; UI state still updates.
+        }
+      })();
       return next;
     });
   };
