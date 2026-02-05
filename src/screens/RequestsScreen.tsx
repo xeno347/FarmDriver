@@ -9,14 +9,15 @@ import {
   Modal,
   Switch,
   Alert,
-  ActivityIndicator
+  ActivityIndicator,
+  RefreshControl,
 } from 'react-native';
-// import { WebView } from 'react-native-webview'; // Commented out for safety
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Icon from 'react-native-vector-icons/Feather';
 import MaterialIcon from 'react-native-vector-icons/MaterialCommunityIcons';
 import { BASE_URL, getStaffId } from '../config/env';
 import { useAuth } from '../contexts/AuthContext';
+import notifee, { AndroidImportance } from '@notifee/react-native';
 
 // --- Types ---
 type Request = {
@@ -25,6 +26,7 @@ type Request = {
   status: 'pending' | 'approved' | 'done';
   title: string;
   reqId?: string;
+  requestId?: string; // backend request_id (present for Logistics Request items)
   amount?: string;
   note?: string;
   location?: string;
@@ -75,10 +77,38 @@ const getStatusIcon = (req: Request) => {
 };
 
 const RequestsScreen = () => {
-  const [requests, setRequests] = useState(initialRequests);
+  // Separate incoming (server) and outgoing (local queued) requests
+  const [incomingRequests, setIncomingRequests] = useState<Request[]>(initialRequests);
+  // Outgoing requests: use dummy data for now (UI only). We'll connect real API/queue later.
+  const [outgoingRequests, setOutgoingRequests] = useState<Request[]>([
+    {
+      id: 'out-1',
+      type: 'fuel',
+      status: 'pending',
+      title: 'FUEL REQUEST',
+      amount: '120L',
+      location: 'West Field - Near Pump 3',
+      colorBg: '#FFFBEB',
+      borderColor: '#FDE68A',
+    },
+    {
+      id: 'out-2',
+      type: 'logistics',
+      status: 'pending',
+      title: 'SPARE PARTS REQUEST',
+      reqId: 'LOCAL-001',
+      note: 'Need oil filter and drive belt',
+      location: 'East Barn',
+      date: new Date().toISOString().split('T')[0],
+      colorBg: '#F3E8FF',
+      borderColor: '#E9D5FF',
+    },
+  ]);
+  const [activeTab, setActiveTab] = useState<'incoming'|'outgoing'>('incoming');
   const [showNewModal, setShowNewModal] = useState(false);
   const [selectedRequest, setSelectedRequest] = useState<Request | null>(null);
   const [syncing, setSyncing] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const { user } = useAuth();
   const [cachedStaffId, setCachedStaffId] = useState<string>('');
   const staffIdRef = useRef<string>('');
@@ -86,39 +116,81 @@ const RequestsScreen = () => {
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptRef = useRef(0);
 
-  const markDelivered = (requestId: Request['id']) => {
-    setRequests((prev) =>
+  const updateRequestStatusDelivered = async (req: Request) => {
+    // Only for incoming logistics requests
+    const planId = String(req.reqId ?? '').trim();
+    const requestId = String(req.requestId ?? '').trim();
+    if (!planId || !requestId) {
+      Alert.alert('Missing data', 'Unable to update status (missing plan_id/request_id).');
+      return false;
+    }
+
+    const payload = {
+      plan_id: planId,
+      date: String(req.date ?? new Date().toISOString().split('T')[0]),
+      activity: String(req.title ?? 'Logistics Request'),
+      request_id: requestId,
+    };
+
+    try {
+      const res = await fetch(`${BASE_URL}/admin_vehicles/update_request_status`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => null);
+      if (res.ok && data?.success === true) return true;
+      console.log('update_request_status failed', res.status, data);
+      return false;
+    } catch (e) {
+      console.log('update_request_status error', e);
+      return false;
+    }
+  };
+
+  const markDelivered = async (requestId: Request['id']) => {
+    // find in incoming
+    const req = incomingRequests.find((r) => String(r.id) === String(requestId));
+    if (!req) return;
+
+    // Only incoming logistics should hit API
+    if (req.type === 'logistics') {
+      setSyncing(true);
+      const ok = await updateRequestStatusDelivered(req);
+      setSyncing(false);
+
+      if (!ok) {
+        Alert.alert('Error', 'Unable to mark delivered. Please try again.');
+        return;
+      }
+    }
+
+    // update incoming UI (after API success)
+    setIncomingRequests((prev) =>
       prev.map((r) =>
         String(r.id) === String(requestId)
-          ? {
-              ...r,
-              status: 'done',
-              colorBg: '#ECFDF5',
-              borderColor: '#6EE7B7',
-            }
+          ? { ...r, status: 'done', colorBg: '#ECFDF5', borderColor: '#6EE7B7' }
           : r
       )
     );
 
+    // NOTE: outgoing requests are not updated here (API is only for incoming)
+
     setSelectedRequest((prev) =>
       prev && String(prev.id) === String(requestId)
-        ? {
-            ...prev,
-            status: 'done',
-            colorBg: '#ECFDF5',
-            borderColor: '#6EE7B7',
-          }
+        ? { ...prev, status: 'done', colorBg: '#ECFDF5', borderColor: '#6EE7B7' }
         : prev
     );
   };
 
+  // Stats reflect incoming requests (server-side)
   const stats = useMemo(() => {
     return {
-      pending: requests.filter(r => r.status === 'pending').length,
-      approved: requests.filter(r => r.status === 'approved').length,
-      done: requests.filter(r => r.status === 'done').length,
+      pending: incomingRequests.filter(r => r.status === 'pending').length,
+      approved: incomingRequests.filter(r => r.status === 'approved').length,
+      done: incomingRequests.filter(r => r.status === 'done').length,
     };
-  }, [requests]);
+  }, [incomingRequests]);
 
   const normalizeStatus = (status: unknown): Request['status'] => {
     const s = String(status ?? '').trim().toLowerCase();
@@ -165,6 +237,7 @@ const RequestsScreen = () => {
       status: normalizeStatus(entry?.status ?? data?.status),
       title: 'LOGISTICS REQUEST',
       reqId: planId || undefined,
+      requestId: data?.request_id ? String(data.request_id) : undefined,
       note: [
         entry?.staff_name ? `Name: ${entry.staff_name}` : null,
         entry?.staff_contact ? `Contact: ${entry.staff_contact}` : null,
@@ -177,7 +250,7 @@ const RequestsScreen = () => {
       borderColor: '#E5E7EB',
     };
 
-    setRequests((prev) => {
+    setIncomingRequests((prev) => {
       const existingIndex = prev.findIndex((r) => String(r.id) === String(newReq.id));
       if (existingIndex >= 0) {
         const copy = [...prev];
@@ -208,9 +281,13 @@ const RequestsScreen = () => {
     staffIdRef.current = String(user?.id || getStaffId() || cachedStaffId || '').trim();
   }, [user?.id, cachedStaffId]);
 
+  const getResolvedStaffId = () => {
+    return String(staffIdRef.current || user?.id || getStaffId() || cachedStaffId || '').trim();
+  };
+
   useEffect(() => {
     const syncLogisticsFromTasksApi = async () => {
-      const staffId = getStaffId();
+      const staffId = getResolvedStaffId();
       if (!staffId) return;
 
       setSyncing(true);
@@ -228,6 +305,7 @@ const RequestsScreen = () => {
             status: normalizeStatus(t?.status),
             title: 'LOGISTICS REQUEST',
             reqId: planId || undefined,
+            requestId: t?.request_id ? String(t.request_id) : undefined,
             note: t?.farm_id ? String(t.farm_id) : undefined,
             location: parseLogisticsLocation(t?.farm_id) || 'Unknown',
             date: t?.date ? String(t.date) : undefined,
@@ -237,14 +315,17 @@ const RequestsScreen = () => {
           };
         });
 
-        // Merge without duplicates (by id)
-        setRequests((prev) => {
-          const seen = new Set(prev.map((r) => String(r.id)));
-          const toAdd = mapped.filter((r) => !seen.has(String(r.id)));
-          return toAdd.length ? [...toAdd, ...prev] : prev;
+        // Merge without duplicates into incomingRequests (by id), but also update existing ones to ensure requestId/reqId are present
+        setIncomingRequests((prev) => {
+          const byId = new Map(prev.map((r) => [String(r.id), r] as const));
+          for (const next of mapped) {
+            const key = String(next.id);
+            const existing = byId.get(key);
+            byId.set(key, existing ? { ...existing, ...next } : next);
+          }
+          return Array.from(byId.values());
         });
       } catch (e) {
-        // Avoid noisy alerts here; screen can still work with manual requests.
         console.log('Requests sync error:', e);
       } finally {
         setSyncing(false);
@@ -252,10 +333,24 @@ const RequestsScreen = () => {
     };
 
     syncLogisticsFromTasksApi();
-  }, []);
+  }, [user?.id, cachedStaffId]);
 
   // WebSocket: listen for logistics request events and show them in realtime
   useEffect(() => {
+    // create notifee channel (safe to call repeatedly)
+    (async () => {
+      try {
+        await notifee.createChannel({
+          id: 'default',
+          name: 'Default',
+          vibration: true,
+          importance: AndroidImportance.HIGH,
+        });
+      } catch (e) {
+        console.log('notifee channel create error:', e);
+      }
+    })();
+
     const wsUrl = buildWebSocketUrl(BASE_URL, '/ws/logistics');
 
     const cleanupTimers = () => {
@@ -297,7 +392,31 @@ const RequestsScreen = () => {
         if (!incomingStaffId || !currentStaffId) return;
         if (incomingStaffId !== currentStaffId) return;
 
+        // add request to list
         upsertIncomingLogisticsRequest(msg);
+        // notify via notifee (native) with Alert fallback
+        try {
+          const planId = String(msg?.data?.plan_id ?? msg?.plan_id ?? msg?.data?.reqId ?? '').trim();
+          const title = planId ? `New Logistics Request (${planId})` : 'New Logistics Request';
+          const body = String(msg?.data?.plan_entry?.request ?? msg?.data?.request ?? msg?.data?.note ?? msg?.data?.farm_id ?? 'You have a new logistics request');
+
+          // display native notification
+          notifee.displayNotification({
+            title,
+            body,
+            android: {
+              channelId: 'default',
+              smallIcon: 'ic_launcher',
+              pressAction: { id: 'default' },
+              importance: AndroidImportance.HIGH,
+            },
+          }).catch((err: unknown) => {
+            console.log('notifee display error:', err);
+            try { Alert.alert(title, body); } catch (e) { /* ignore */ }
+          });
+        } catch (e) {
+          try { Alert.alert('New Logistics Request', 'You have a new logistics request'); } catch (er) { /* ignore */ }
+        }
       } catch (e) {
         console.log('[ws/logistics] message parse error:', e);
         // ignore invalid payloads
@@ -346,7 +465,6 @@ const RequestsScreen = () => {
 
   // Form State
   const [requestType, setRequestType] = useState<'fuel'|'logistics'>('fuel');
-  const [reqName, setReqName] = useState('');
   const [note, setNote] = useState('');
   
   // Fuel State
@@ -357,37 +475,238 @@ const RequestsScreen = () => {
   // Logistics State
   const [logisticsLocation, setLogisticsLocation] = useState('');
   const [date, setDate] = useState('');
-  const [time, setTime] = useState('');
+  // Date picker and location helper UI states
+  const [datePickerVisible, setDatePickerVisible] = useState(false);
+  const [datePickerDate, setDatePickerDate] = useState<Date>(new Date());
 
-  const handleMakeRequest = () => {
-    const newReq: Request = {
-      id: Date.now(),
-      type: requestType,
-      status: 'pending',
-      title: requestType === 'fuel' ? 'FUEL REQUEST' : reqName || 'LOGISTICS REQUEST',
-      reqId: `REQ-${Math.floor(Math.random() * 1000)}`,
-      colorBg: '#FFFFFF',
-      borderColor: '#E5E7EB',
+  const openDatePicker = () => {
+    try {
+      setDatePickerDate(date ? new Date(date) : new Date());
+    } catch (e) {
+      setDatePickerDate(new Date());
+    }
+    setDatePickerVisible(true);
+  };
+
+  const confirmDatePicker = () => {
+    setDate(datePickerDate.toISOString().split('T')[0]);
+    setDatePickerVisible(false);
+  };
+
+  const adjustDate = (days: number) => {
+    setDatePickerDate((prev) => new Date(prev.getTime() + days * 24 * 60 * 60 * 1000));
+  };
+
+  const handleUseCurrentLocation = () => {
+    // quick placeholder while we attempt to fetch actual coords
+    setLogisticsLocation('Current Location (GPS)');
+    try {
+      const geo = (globalThis as any).navigator?.geolocation ?? (globalThis as any).geolocation;
+      if (geo && geo.getCurrentPosition) {
+        geo.getCurrentPosition(
+          (pos: any) => {
+            const { latitude, longitude } = pos.coords || {};
+            if (latitude != null && longitude != null) {
+              setLogisticsLocation(`Lat: ${latitude.toFixed(5)}, Lon: ${longitude.toFixed(5)}`);
+            }
+          },
+          (err: any) => {
+            console.log('geolocation error', err);
+          },
+          { enableHighAccuracy: true, timeout: 10000, maximumAge: 10000 }
+        );
+      }
+    } catch (e) {
+      console.log('geolocation not available', e);
+    }
+  };
+
+  const handleMakeRequest = async () => {
+    const staffId = String(staffIdRef.current || getStaffId() || user?.id || '').trim();
+    const payload = {
+      staff_id: staffId,
+      date: date || new Date().toISOString().split('T')[0],
+      note: note || '',
+      request_location: requestType === 'fuel' ? (useCurrentLocation ? 'Current Location (GPS)' : manualLocation) : logisticsLocation || '',
     };
 
-    if (requestType === 'fuel') {
-      newReq.amount = fuelAmount + 'L';
-      newReq.location = useCurrentLocation 
-        ? `Current Location (GPS)` 
-        : manualLocation;
-    } else {
-      newReq.note = note;
-      newReq.location = logisticsLocation;
-      newReq.date = date;
-      newReq.time = time;
+    setSyncing(true);
+    let createdReqId: string | undefined;
+    try {
+      const res = await fetch(`${BASE_URL}/admin_ops_requests/make_request`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      if (res.ok) {
+        const data: any = await res.json();
+        // treat API success flag explicitly
+        if (data?.success === true) {
+          createdReqId = String(data?.plan_id ?? data?.id ?? data?.reqId ?? '').trim() || undefined;
+          try { Alert.alert('Request submitted', 'Your request was submitted successfully.'); } catch (e) { /* ignore */ }
+        } else {
+          // Not successful according to API; log and fall back to local queued request
+          console.log('make_request response indicates failure:', data);
+        }
+      } else {
+        console.log('make_request failed status:', res.status);
+      }
+    } catch (e) {
+      console.log('make_request error:', e);
+    } finally {
+      setSyncing(false);
     }
 
-    setRequests([newReq, ...requests]);
+    // DO NOT add outgoing requests to the visible requests list.
+    // Instead queue them locally so they can be synced later by a background job or manual sync.
+    try {
+      const raw = await AsyncStorage.getItem('OUTGOING_REQUEST_QUEUE');
+      const queue: any[] = raw ? JSON.parse(raw) : [];
+      queue.push({ id: Date.now(), payload, createdReqId, createdAt: new Date().toISOString() });
+      await AsyncStorage.setItem('OUTGOING_REQUEST_QUEUE', JSON.stringify(queue));
+    } catch (e) {
+      console.log('failed to save outgoing request to queue:', e);
+    }
+
+    // Reset UI and close modal (do not show outgoing request in list)
     setShowNewModal(false);
     setFuelAmount('');
     setNote('');
+    setManualLocation('');
+    setLogisticsLocation('');
+    setDate('');
+
+    if (!createdReqId) {
+      try { Alert.alert('Request queued', 'Offline/local request created. Will sync when available.'); } catch (e) { /* ignore */ }
+    }
   };
 
+  // Fetch outgoing requests from server for the cached staff id and map into UI state
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadOutgoing = async () => {
+      const staffId = String(user?.id || getStaffId() || cachedStaffId || '').trim();
+      if (!staffId) return;
+
+      try {
+        const res = await fetch(`${BASE_URL}/admin_ops_requests/get_outgoing_requests/${encodeURIComponent(staffId)}`);
+        if (!res.ok) {
+          console.log('failed to fetch outgoing requests, status:', res.status);
+          return;
+        }
+        const data: any = await res.json();
+        const obj = data?.outgoing_requests ?? {};
+        const list: Request[] = Object.keys(obj).map((key) => {
+          const d = obj[key] || {};
+          return {
+            id: key,
+            type: 'logistics',
+            status: normalizeStatus(d?.status ?? d?.Status ?? ''),
+            title: 'LOGISTICS REQUEST',
+            reqId: key,
+            note: d?.request ? String(d.request) : undefined,
+            location: d?.request_location || undefined,
+            date: d?.date ? String(d.date) : undefined,
+            colorBg: '#F3E8FF',
+            borderColor: '#E9D5FF',
+          };
+        });
+
+        if (!cancelled) setOutgoingRequests(list);
+      } catch (e) {
+        console.log('error loading outgoing requests:', e);
+      }
+    };
+
+    loadOutgoing();
+
+    return () => { cancelled = true; };
+  }, [cachedStaffId, user?.id]);
+
+  // Pull-to-refresh handler: re-run the logistics sync and outgoing load
+  const onRefresh = async () => {
+    setRefreshing(true);
+    setSyncing(true);
+    try {
+      const staffId = getResolvedStaffId();
+      if (!staffId) return;
+
+      // Fetch tasks and merge logistics into incomingRequests
+      try {
+        const res = await fetch(`${BASE_URL}/admin_vehicles/get_all_task/${encodeURIComponent(staffId)}`);
+        const data = await res.json();
+        const pendingTasks: any[] = Array.isArray(data?.pending_tasks) ? data.pending_tasks : [];
+        const logisticsPending = pendingTasks.filter((t: any) => isLogisticsRequestActivity(t?.activity));
+
+        const mapped: Request[] = logisticsPending.map((t: any) => {
+          const planId = String(t?.plan_id ?? '');
+          return {
+            id: planId || `${t?.vehicle_id ?? ''}_${t?.date ?? ''}_${t?.farm_id ?? ''}`,
+            type: 'logistics',
+            status: normalizeStatus(t?.status),
+            title: 'LOGISTICS REQUEST',
+            reqId: planId || undefined,
+            requestId: t?.request_id ? String(t.request_id) : undefined,
+            note: t?.farm_id ? String(t.farm_id) : undefined,
+            location: parseLogisticsLocation(t?.farm_id) || 'Unknown',
+            date: t?.date ? String(t.date) : undefined,
+            time: undefined,
+            colorBg: '#FFFFFF',
+            borderColor: '#E5E7EB',
+          };
+        });
+
+        // Merge + update existing so requestId isn't missing
+        setIncomingRequests((prev) => {
+          const byId = new Map(prev.map((r) => [String(r.id), r] as const));
+          for (const next of mapped) {
+            const key = String(next.id);
+            const existing = byId.get(key);
+            byId.set(key, existing ? { ...existing, ...next } : next);
+          }
+          return Array.from(byId.values());
+        });
+      } catch (e) {
+        console.log('onRefresh: tasks fetch error', e);
+      }
+
+      // Reload outgoing requests from server
+      try {
+        const res2 = await fetch(`${BASE_URL}/admin_ops_requests/get_outgoing_requests/${encodeURIComponent(staffId)}`);
+        if (res2.ok) {
+          const data2: any = await res2.json();
+          const obj = data2?.outgoing_requests ?? {};
+          const list: Request[] = Object.keys(obj).map((key) => {
+            const d = obj[key] || {};
+            return {
+              id: key,
+              type: 'logistics',
+              status: normalizeStatus(d?.status ?? d?.Status ?? ''),
+              title: 'LOGISTICS REQUEST',
+              reqId: key,
+              note: d?.request ? String(d.request) : undefined,
+              location: d?.request_location || undefined,
+              date: d?.date ? String(d.date) : undefined,
+              colorBg: '#F3E8FF',
+              borderColor: '#E9D5FF',
+            };
+          });
+          setOutgoingRequests(list);
+        } else {
+          console.log('onRefresh: failed to fetch outgoing requests, status:', res2.status);
+        }
+      } catch (e) {
+        console.log('onRefresh: outgoing fetch error', e);
+      }
+    } finally {
+      setSyncing(false);
+      setRefreshing(false);
+    }
+  };
+
+  // use wrapped function in UI
   return (
     <View style={styles.container}>
       
@@ -403,20 +722,21 @@ const RequestsScreen = () => {
         </TouchableOpacity>
       </View>
 
-      {/* STATUS ROW */}
-      <View style={styles.statusRow}>
-        <View style={[styles.statusCard, styles.cardPending]}> 
-          <Text style={styles.statusLabel}>PENDING</Text>
-          <Text style={[styles.statusValue, { color: '#1F2937' }]}>{stats.pending}</Text>
-        </View>
-        <View style={[styles.statusCard, styles.cardApproved]}> 
-          <Text style={[styles.statusLabel, {color: '#1E40AF'}]}>APPROVED</Text>
-          <Text style={[styles.statusValue, { color: '#1E40AF' }]}>{stats.approved}</Text>
-        </View>
-        <View style={[styles.statusCard, styles.cardDone]}> 
-          <Text style={[styles.statusLabel, {color: '#065F46'}]}>DONE</Text>
-          <Text style={[styles.statusValue, { color: '#065F46' }]}>{stats.done}</Text>
-        </View>
+      {/* TAB SWITCHER */}
+      <View style={styles.tabRow}>
+        <TouchableOpacity
+          style={[styles.tabBtn, activeTab === 'incoming' && styles.tabBtnActive]}
+          onPress={() => setActiveTab('incoming')}
+        >
+          <Text style={[styles.tabBtnText, activeTab === 'incoming' && styles.tabBtnTextActive]}>Incoming ({incomingRequests.length})</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.tabBtn, activeTab === 'outgoing' && styles.tabBtnActive]}
+          onPress={() => setActiveTab('outgoing')}
+        >
+          <Text style={[styles.tabBtnText, activeTab === 'outgoing' && styles.tabBtnTextActive]}>Outgoing ({outgoingRequests.length})</Text>
+        </TouchableOpacity>
       </View>
 
       {syncing && (
@@ -431,68 +751,92 @@ const RequestsScreen = () => {
       )}
 
       {/* LIST */}
-      <ScrollView contentContainerStyle={{ paddingBottom: 40, paddingHorizontal: 20 }}>
-        {requests.map((req) => {
-          const iconStyle = getIconStyles(req.type);
-          const statusIcon = getStatusIcon(req);
+      <ScrollView
+        contentContainerStyle={{ paddingBottom: 40, paddingHorizontal: 20 }}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={["#3b82f6"]} tintColor="#3b82f6" />}
+      >
+        {/* detect duplicate keys at runtime and warn */}
+        {(() => {
+          const seen = new Set<string>();
+          const dupes: string[] = [];
+          const displayed = activeTab === 'incoming' ? incomingRequests : outgoingRequests;
+          displayed.forEach((r) => {
+            const k = `${String(r.id)}-${r.reqId ?? ''}-${r.type}`;
+            if (seen.has(k)) dupes.push(k);
+            seen.add(k);
+          });
+          if (dupes.length) {
+            console.warn('[RequestsScreen] duplicate request keys detected:', dupes);
+          }
+          return displayed.map((req, idx) => {
+            const iconStyle = getIconStyles(req.type);
+            const statusIcon = getStatusIcon(req);
+            const key = `${String(req.id)}-${req.reqId ?? ''}-${req.type}-${idx}`; // include index as a fallback to guarantee uniqueness
 
-          return (
-            <TouchableOpacity 
-              key={req.id} 
-              activeOpacity={0.8}
-              onPress={() => setSelectedRequest(req)}
-              style={[styles.requestCard, { backgroundColor: req.colorBg, borderColor: req.borderColor }]}
-            >
-              <View style={styles.cardHeader}>
-                <View style={styles.leftContainer}>
-                  <View style={[styles.iconBox, { backgroundColor: '#fff', borderColor: iconStyle.border }]}>
-                    <Icon name={iconStyle.name} size={20} color={iconStyle.icon} />
-                  </View>
-                  <View style={{ marginLeft: 12 }}>
-                    <Text style={styles.reqTitle}>{req.title}</Text>
-                    {req.type === 'logistics' && <Text style={styles.reqId}>{req.reqId}</Text>}
-                    {req.type === 'fuel' && <Text style={styles.fuelAmount}>{req.amount}</Text>}
-                  </View>
-                </View>
-                <MaterialIcon name={statusIcon.name} size={24} color={statusIcon.color} />
-              </View>
-
-              {req.type === 'fuel' && req.location && (
-                 <View style={{ marginTop: 8, paddingLeft: 54 }}>
-                    <View style={{flexDirection:'row', alignItems:'center'}}>
-                      <Icon name="map-pin" size={10} color="#6B7280" />
-                      <Text style={{fontSize: 11, color: '#6B7280', marginLeft: 4}}>{req.location}</Text>
+            return (
+              <TouchableOpacity
+                key={key}
+                activeOpacity={0.8}
+                onPress={() => setSelectedRequest(req)}
+                style={[styles.requestCard, { backgroundColor: req.colorBg, borderColor: req.borderColor }]}
+              >
+                <View style={styles.cardHeader}>
+                  <View style={styles.leftContainer}>
+                    <View style={[styles.iconBox, { backgroundColor: '#fff', borderColor: iconStyle.border }]}>
+                      <Icon name={iconStyle.name} size={20} color={iconStyle.icon} />
                     </View>
-                 </View>
-              )}
-
-              {req.type === 'logistics' && (
-                <View style={styles.logisticsBody}>
-                  <Text style={styles.logisticsNote}>{req.note}</Text>
-                  <View style={styles.divider} />
-                  <View style={styles.logisticsFooter}>
-                    <Text style={styles.footerText}>{req.location}</Text>
-                    <Text style={styles.footerText}>{req.date}  {req.time}</Text>
+                    <View style={{ marginLeft: 12 }}>
+                      <Text style={styles.reqTitle}>{req.title}</Text>
+                      {req.type === 'logistics' && <Text style={styles.reqId}>{req.reqId}</Text>}
+                      {req.type === 'fuel' && <Text style={styles.fuelAmount}>{req.amount}</Text>}
+                    </View>
                   </View>
+                  <MaterialIcon name={statusIcon.name} size={24} color={statusIcon.color} />
                 </View>
-              )}
 
-              <View style={styles.cardActionsRow}>
-                <TouchableOpacity
-                  activeOpacity={0.85}
-                  onPress={() => markDelivered(req.id)}
-                  disabled={req.status === 'done'}
-                  style={[styles.deliveredBtn, req.status === 'done' && styles.deliveredBtnDisabled]}
-                >
-                  <Icon name="check-circle" size={16} color="#fff" style={{ marginRight: 8 }} />
-                  <Text style={styles.deliveredBtnText}>
-                    {req.status === 'done' ? 'DELIVERED' : 'MARK DELIVERED'}
-                  </Text>
-                </TouchableOpacity>
-              </View>
-            </TouchableOpacity>
-          );
-        })}
+                {req.type === 'fuel' && req.location && (
+                   <View style={{ marginTop: 8, paddingLeft: 54 }}>
+                      <View style={{flexDirection:'row', alignItems:'center'}}>
+                        <Icon name="map-pin" size={10} color="#6B7280" />
+                        <Text style={{fontSize: 11, color: '#6B7280', marginLeft: 4}}>{req.location}</Text>
+                      </View>
+                   </View>
+                )}
+
+                {req.type === 'logistics' && (
+                  <View style={styles.logisticsBody}>
+                    <Text style={styles.logisticsNote}>{req.note}</Text>
+                    <View style={styles.divider} />
+                    <View style={styles.logisticsFooter}>
+                      <Text style={styles.footerText}>{req.location}</Text>
+                      <Text style={styles.footerText}>{req.date}</Text>
+                    </View>
+                  </View>
+                )}
+
+                <View style={styles.cardActionsRow}>
+                  {activeTab === 'outgoing' ? (
+                    <View style={[styles.outgoingStatus, req.status === 'pending' ? { backgroundColor: '#FEF3C7' } : req.status === 'approved' ? { backgroundColor: '#EFF6FF' } : { backgroundColor: '#ECFDF5' }]}>
+                      <Text style={[styles.outgoingStatusText, req.status === 'pending' ? { color: '#92400E' } : req.status === 'approved' ? { color: '#1E40AF' } : { color: '#065F46' }]}>{req.status.toUpperCase()}</Text>
+                    </View>
+                  ) : (
+                    <TouchableOpacity
+                      activeOpacity={0.85}
+                      onPress={() => markDelivered(req.id)}
+                      disabled={req.status === 'done'}
+                      style={[styles.deliveredBtn, req.status === 'done' && styles.deliveredBtnDisabled]}
+                    >
+                      <Icon name="check-circle" size={16} color="#fff" style={{ marginRight: 8 }} />
+                      <Text style={styles.deliveredBtnText}>
+                        {req.status === 'done' ? 'DELIVERED' : 'MARK DELIVERED'}
+                      </Text>
+                    </TouchableOpacity>
+                  )}
+                </View>
+              </TouchableOpacity>
+            );
+          });
+        })()}
       </ScrollView>
 
       {/* --- NEW REQUEST MODAL --- */}
@@ -570,32 +914,31 @@ const RequestsScreen = () => {
               )}
 
               {/* LOGISTICS FORM */}
-              {requestType === 'logistics' && (
-                <View>
-                  <Text style={styles.label}>REQUEST NAME</Text>
-                  <TextInput style={styles.input} placeholder="e.g., Spare Parts" value={reqName} onChangeText={setReqName} />
-                  <Text style={styles.label}>NOTE</Text>
-                  <TextInput style={[styles.input, { height: 80, textAlignVertical: 'top' }]} placeholder="Details..." multiline value={note} onChangeText={setNote} />
-                  <Text style={styles.label}>LOCATION</Text>
-                  <TextInput style={styles.input} placeholder="e.g., North Field A" value={logisticsLocation} onChangeText={setLogisticsLocation} />
-                  <View style={styles.rowInputs}>
-                    <View style={{ flex: 1, marginRight: 8 }}>
+               {requestType === 'logistics' && (
+                 <View>
+                   <Text style={styles.label}>NOTE</Text>
+                   <TextInput style={[styles.input, { height: 80, textAlignVertical: 'top' }]} placeholder="Details..." multiline value={note} onChangeText={setNote} />
+                   <Text style={styles.label}>LOCATION</Text>
+                   <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                     <TextInput style={[styles.input, { flex: 1, marginRight: 8 }]} placeholder="e.g., North Field A" value={logisticsLocation} onChangeText={setLogisticsLocation} />
+                     <TouchableOpacity style={styles.useLocationBtn} onPress={handleUseCurrentLocation}>
+                       <Icon name="crosshair" size={16} color="#fff" />
+                     </TouchableOpacity>
+                   </View>
+
+                   <View style={styles.rowInputs}>
+                    <View style={{ flex: 1 }}>
                       <Text style={styles.label}>DATE</Text>
                       <View style={styles.iconInput}>
-                        <TextInput style={styles.flexInput} placeholder="dd-mm-yyyy" value={date} onChangeText={setDate} />
-                        <Icon name="calendar" size={18} color="#4B5563" />
-                      </View>
-                    </View>
-                    <View style={{ flex: 1, marginLeft: 8 }}>
-                      <Text style={styles.label}>TIME</Text>
-                      <View style={styles.iconInput}>
-                        <TextInput style={styles.flexInput} placeholder="--:--" value={time} onChangeText={setTime} />
-                        <Icon name="clock" size={18} color="#4B5563" />
+                        <TextInput style={styles.flexInput} placeholder="yyyy-mm-dd" value={date} onChangeText={setDate} />
+                        <TouchableOpacity onPress={openDatePicker} style={{ paddingLeft: 8 }}>
+                          <Icon name="calendar" size={18} color="#4B5563" />
+                        </TouchableOpacity>
                       </View>
                     </View>
                   </View>
-                </View>
-              )}
+                 </View>
+               )}
 
               <View style={styles.modalFooterBtns}>
                 <TouchableOpacity style={styles.cancelBtn} onPress={() => setShowNewModal(false)}>
@@ -693,6 +1036,37 @@ const RequestsScreen = () => {
         </View>
       </Modal>
 
+      {/* Simple Date Picker Modal */}
+      <Modal visible={datePickerVisible} animationType="slide" transparent onRequestClose={() => setDatePickerVisible(false)}>
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalContent, { maxHeight: 260, padding: 16 }]}>
+            <Text style={{ fontSize: 16, fontWeight: '800', marginBottom: 12 }}>Select Date</Text>
+            <View style={{ alignItems: 'center', marginBottom: 12 }}>
+              <Text style={{ fontSize: 18, fontWeight: '700' }}>{datePickerDate.toISOString().split('T')[0]}</Text>
+            </View>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 12 }}>
+              <TouchableOpacity style={[styles.cancelBtn, { flex: 0.3 }]} onPress={() => adjustDate(-1)}>
+                <Text style={styles.cancelBtnText}>Prev</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[styles.cancelBtn, { flex: 0.3 }]} onPress={() => setDatePickerDate(new Date())}>
+                <Text style={styles.cancelBtnText}>Today</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[styles.cancelBtn, { flex: 0.3 }]} onPress={() => adjustDate(1)}>
+                <Text style={styles.cancelBtnText}>Next</Text>
+              </TouchableOpacity>
+            </View>
+            <View style={{ flexDirection: 'row', justifyContent: 'flex-end' }}>
+              <TouchableOpacity style={[styles.cancelBtn, { marginRight: 8 }]} onPress={() => setDatePickerVisible(false)}>
+                <Text style={styles.cancelBtnText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.submitBtn} onPress={confirmDatePicker}>
+                <Text style={styles.submitBtnText}>Done</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
     </View>
   );
 };
@@ -761,7 +1135,15 @@ const styles = StyleSheet.create({
   deliveredBtnDisabled: { opacity: 0.55 },
   deliveredBtnText: { color: '#fff', fontWeight: '900', fontSize: 13, letterSpacing: 0.4 },
   denyBtn: { flex: 1, flexDirection: 'row', backgroundColor: '#DC2626', paddingVertical: 14, borderRadius: 8, marginRight: 8, alignItems: 'center', justifyContent: 'center' },
-  actionBtnText: { color: '#fff', fontWeight: '800', fontSize: 14 }
+  actionBtnText: { color: '#fff', fontWeight: '800', fontSize: 14 },
+  tabRow: { flexDirection: 'row', paddingHorizontal: 20, marginBottom: 12 },
+  tabBtn: { flex: 1, paddingVertical: 10, borderRadius: 12, backgroundColor: '#fff', borderWidth: 1, borderColor: '#E5E7EB', alignItems: 'center', marginRight: 8 },
+  tabBtnActive: { backgroundColor: '#111827', borderColor: '#111827' },
+  tabBtnText: { fontWeight: '800', color: '#6B7280' },
+  tabBtnTextActive: { color: '#fff' },
+  outgoingStatus: { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 8, alignSelf: 'flex-start' },
+  outgoingStatusText: { fontWeight: '800' },
+  useLocationBtn: { backgroundColor: '#10B981', paddingHorizontal: 12, paddingVertical: 10, borderRadius: 8, justifyContent: 'center', alignItems: 'center' },
 });
 
 export default RequestsScreen;

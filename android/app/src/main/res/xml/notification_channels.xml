@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<channels>
+  <channel
+    id="farmdriver-requests"
+    name="Requests"
+    description="Notifications for logistics requests"
+    importance="high" />
+</channels>

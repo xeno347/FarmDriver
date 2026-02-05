@@ -11,6 +11,7 @@
     "dev": "concurrently \"npm run start\" \"npm run android\""
   },
   "dependencies": {
+    "@notifee/react-native": "^9.1.8",
     "@react-native-async-storage/async-storage": "2.2.0",
     "@react-native/gradle-plugin": "0.83.1",
     "@react-native/new-app-screen": "0.83.1",

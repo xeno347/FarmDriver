@@ -10,7 +10,8 @@ import {
   Alert,
   KeyboardAvoidingView,
   Platform,
-  ScrollView
+  ScrollView,
+  ActivityIndicator
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useNavigation } from '@react-navigation/native'; // 1. Import Navigation Hook
@@ -29,6 +30,8 @@ const HomeScreen = () => {
   const [fuelRequest, setFuelRequest] = useState('');
   type RequestDetails = { id: string; location: string; status: string } | null;
   const [requestDetails, setRequestDetails] = useState<RequestDetails>(null);
+  // show spinner while a fuel request is pending on the server
+  const [requestLoading, setRequestLoading] = useState(false);
 
   // Load cached request_id on mount if exists
   useEffect(() => {
@@ -37,10 +40,99 @@ const HomeScreen = () => {
         const cached = await AsyncStorage.getItem('CHECKIN_REQUEST_ID');
         if (cached) {
           setRequestDetails({ id: cached, location: 'Fuel Station B (North)', status: 'Pending' });
+          // If we have a cached request id assume it's pending until server confirms otherwise
+          setRequestLoading(true);
         }
       } catch (e) {}
     };
     loadCachedRequest();
+  }, []);
+
+  // WebSocket: listen for fuel request updates from server at /ws/fuel_requests
+  useEffect(() => {
+    const staffId = String(getStaffId() || '').trim();
+    if (!staffId) return;
+
+    const buildWebSocketUrl = (baseUrl: string, path: string) => {
+      const trimmedBase = String(baseUrl ?? '').trim().replace(/\/+$/, '');
+      const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+      const httpUrl = `${trimmedBase}${normalizedPath}`;
+      if (httpUrl.startsWith('wss://') || httpUrl.startsWith('ws://')) return httpUrl;
+      if (httpUrl.startsWith('https://')) return httpUrl.replace(/^https:\/\//, 'wss://');
+      if (httpUrl.startsWith('http://')) return httpUrl.replace(/^http:\/\//, 'ws://');
+      return `wss://${httpUrl.replace(/^\/+/, '')}`;
+    };
+
+    const wsUrl = buildWebSocketUrl(BASE_URL, '/ws/fuel_requests');
+    let ws: WebSocket | null = null;
+
+    try {
+      ws = new WebSocket(wsUrl);
+      ws.onopen = () => console.log('[ws/fuel_requests] open', wsUrl);
+
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(String(ev.data ?? '{}'));
+          if (msg?.event !== 'fuel_request_updated') return;
+
+          const d = msg?.data ?? {};
+          const incomingStaff = String(d.staff_id ?? '').trim();
+          if (!incomingStaff || incomingStaff !== staffId) return;
+
+          // Normalize status and update the small request summary on Home
+          const rawStatus = String(d.new_status ?? '').trim();
+          const lower = rawStatus.toLowerCase();
+          const isComplete = ['completed', 'done', 'fulfilled', 'closed'].includes(lower);
+
+          const updatedDetails = {
+            id: String(d.request_id ?? Date.now()),
+            location: d.vehicle_number ? String(d.vehicle_number) : `Vehicle ${d.vehicle_id ?? ''}`,
+            status: isComplete ? 'Completed' : (rawStatus || 'Pending'),
+          };
+
+          // If complete: wait for user to acknowledge before marking completed in UI
+          if (isComplete) {
+            try {
+              Alert.alert(
+                'Fuel Request Completed',
+                `Request ${d.request_id} is completed.`,
+                [
+                  {
+                    text: 'OK',
+                    onPress: async () => {
+                      console.log('[ws/fuel_requests] completion OK pressed for', String(d.request_id));
+                      try {
+                        await AsyncStorage.removeItem('CHECKIN_REQUEST_ID');
+                      } catch (e) {
+                        console.log('Failed to remove cached CHECKIN_REQUEST_ID', e);
+                      }
+                      // update UI to completed only after user confirms
+                      setRequestDetails(updatedDetails);
+                      setRequestLoading(false);
+                    }
+                  }
+                ],
+                { cancelable: false }
+              );
+            } catch (e) { /* ignore */ }
+          } else {
+            // non-complete updates: show pending state and notify
+            setRequestDetails(updatedDetails);
+            setRequestLoading(true);
+            try { Alert.alert('Fuel Request Update', `Request ${d.request_id} status: ${d.new_status}`); } catch (e) {}
+          }
+        } catch (e) {
+          console.log('[ws/fuel_requests] parse error', e);
+        }
+      };
+
+      ws.onerror = (e) => console.log('[ws/fuel_requests] error', e);
+      ws.onclose = () => console.log('[ws/fuel_requests] closed');
+    } catch (e) {
+      console.log('[ws/fuel_requests] connect error', e);
+    }
+
+    return () => { try { ws?.close(); } catch (e) {} };
   }, []);
 
   const styles = makeStyles(colors);
@@ -85,6 +177,11 @@ const HomeScreen = () => {
         try {
           await AsyncStorage.setItem('CHECKIN_REQUEST_ID', data.request_id);
         } catch (e) {}
+
+        // If a fuel request was actually asked, mark loading until WS confirms completion
+        if (parseFloat(fuelRequest) > 0) {
+          setRequestLoading(true);
+        }
 
         if (parseFloat(fuelRequest) > 0) {
           Alert.alert('Request Pending', `Fuel request for ${fuelRequest}L sent. Status is now PENDING.`);
@@ -201,8 +298,10 @@ const HomeScreen = () => {
 
           {requestDetails && (
             <View style={styles.fuelInfoCard}>
-              <View style={[styles.fuelInfoHeader, { backgroundColor: '#FFF8E1', borderBottomColor: '#FFE0B2' }]}>
-                <Text style={[styles.fuelInfoTitle, { color: '#F57C00' }]}>⚠ REQUEST PENDING</Text>
+              <View style={[styles.fuelInfoHeader, { backgroundColor: requestLoading ? '#FFF8E1' : '#E6FFFA', borderBottomColor: requestLoading ? '#FFE0B2' : '#BBF7D0' }]}>
+                <Text style={[styles.fuelInfoTitle, { color: requestLoading ? '#F57C00' : '#059669' }]}>
+                  {requestLoading ? '⚠ REQUEST PENDING' : '✓ REQUEST COMPLETED'}
+                </Text>
               </View>
               <View style={styles.fuelInfoRow}>
                 <View style={{alignItems: 'center'}}>
@@ -216,7 +315,14 @@ const HomeScreen = () => {
                 </View>
               </View>
               <View style={styles.fuelInfoFooter}>
-                <Text style={styles.fuelFooterText}>Status will be confirmed from the main portal</Text>
+                {requestLoading ? (
+                  <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                    <ActivityIndicator size="small" color="#F57C00" />
+                    <Text style={[styles.fuelFooterText, { marginLeft: 8 }]}>Waiting for completion...</Text>
+                  </View>
+                ) : (
+                  <Text style={[styles.fuelFooterText, { color: '#059669' }]}>Request completed. You may proceed.</Text>
+                )}
               </View>
             </View>
           )}

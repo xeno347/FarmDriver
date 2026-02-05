@@ -9,7 +9,9 @@ import {
   Platform,
   Dimensions,
   ActivityIndicator,
-  Alert
+  Alert,
+  RefreshControl,
+  Linking,
 } from 'react-native';
 import MapView, { Marker, PROVIDER_GOOGLE, Region } from 'react-native-maps';
 import { BASE_URL, getStaffId } from '../config/env';
@@ -101,6 +103,79 @@ const TasksScreen = () => {
   const [modalTask, setModalTask] = useState<Task | null>(null);
   const [userLocation, setUserLocation] = useState<{ latitude: number; longitude: number } | null>(null);
   const [mapExpanded, setMapExpanded] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+
+  const mapRef = React.useRef<MapView | null>(null);
+
+  const hasValidCoords = (coords: [number, number] | undefined | null) => {
+    if (!coords || coords.length < 2) return false;
+    const lat = Number(coords[0]);
+    const lng = Number(coords[1]);
+    return Number.isFinite(lat) && Number.isFinite(lng) && lat !== 0 && lng !== 0;
+  };
+
+  const openDirections = async (task: Task) => {
+    if (!hasValidCoords(task.coords)) {
+      Alert.alert('No location', 'No coordinates available for this land.');
+      return;
+    }
+
+    const [lat, lng] = task.coords;
+    const url = Platform.OS === 'ios'
+      ? `http://maps.apple.com/?daddr=${lat},${lng}`
+      : `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}&travelmode=driving`;
+
+    try {
+      const can = await Linking.canOpenURL(url);
+      if (!can) {
+        await Linking.openURL(`https://www.google.com/maps/search/?api=1&query=${lat},${lng}`);
+        return;
+      }
+      await Linking.openURL(url);
+    } catch (e) {
+      console.log('openDirections error', e);
+      Alert.alert('Error', 'Unable to open maps on this device.');
+    }
+  };
+
+  const getMapPoints = () => {
+    const points: Array<{ latitude: number; longitude: number }> = [];
+    if (userLocation) points.push(userLocation);
+    for (const t of tasks) {
+      if (hasValidCoords(t.coords)) points.push({ latitude: t.coords[0], longitude: t.coords[1] });
+    }
+    return points;
+  };
+
+  const fitMapToPoints = () => {
+    const points = getMapPoints();
+    if (!mapRef.current || points.length === 0) return;
+
+    // If we only have the user location, just center there.
+    if (points.length === 1) {
+      mapRef.current.animateToRegion(
+        {
+          latitude: points[0].latitude,
+          longitude: points[0].longitude,
+          latitudeDelta: 0.1,
+          longitudeDelta: 0.1,
+        },
+        350
+      );
+      return;
+    }
+
+    mapRef.current.fitToCoordinates(points, {
+      edgePadding: { top: 80, right: 80, bottom: 80, left: 80 },
+      animated: true,
+    });
+  };
+
+  // After tasks or user location changes, re-fit map.
+  useEffect(() => {
+    fitMapToPoints();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tasks, userLocation]);
 
   // --- Location Effect with TypeScript Fix ---
   useEffect(() => {
@@ -124,44 +199,90 @@ const TasksScreen = () => {
     }
   }, []);
 
-  // --- Data Fetch Effect ---
-  useEffect(() => {
-    const fetchTasks = async () => {
-      setLoading(true);
-      try {
-        const staffId = getStaffId();
-        if (!staffId) {
-          setTasks([]);
-          Alert.alert('Missing Staff ID', 'Please login again and retry.');
-          return;
-        }
-
-        const res = await fetch(`${BASE_URL}/admin_vehicles/get_all_task/${encodeURIComponent(staffId)}`);
-        const data = await res.json();
-
-        // Show ALL pending tasks (no client-side date filtering)
-        let pendingApiTasks: any[] = [];
-        if (Array.isArray(data?.pending_tasks)) {
-          // Backend already scoped to pending; don't over-filter.
-          pendingApiTasks = data.pending_tasks;
-        } else {
-          const raw = extractApiTasksArray(data);
-          pendingApiTasks = raw.filter((t: any) => isPendingStatus(t?.status));
-        }
-
-        // Move "Logistics Request" into Requests tab instead of Tasks tab.
-        const taskApiTasks = pendingApiTasks.filter((t: any) => !isLogisticsRequestActivity(t?.activity));
-        setTasks(taskApiTasks.map(mapApiTaskToUiTask));
-      } catch (e) {
-        console.error('Fetch error:', e);
+  // --- Data Fetching (reusable) ---
+  const fetchTasks = async () => {
+    setLoading(true);
+    try {
+      const staffId = getStaffId();
+      if (!staffId) {
         setTasks([]);
-        Alert.alert('Error', 'Unable to load tasks. Please try again.');
-      } finally {
-        setLoading(false);
+        Alert.alert('Missing Staff ID', 'Please login again and retry.');
+        return;
       }
-    };
+
+      const res = await fetch(`${BASE_URL}/admin_vehicles/get_all_task/${encodeURIComponent(staffId)}`);
+      const data = await res.json();
+
+      // Show ALL pending tasks (no client-side date filtering)
+      let pendingApiTasks: any[] = [];
+      if (Array.isArray(data?.pending_tasks)) {
+        // Backend already scoped to pending; don't over-filter.
+        pendingApiTasks = data.pending_tasks;
+      } else {
+        const raw = extractApiTasksArray(data);
+        pendingApiTasks = raw.filter((t: any) => isPendingStatus(t?.status));
+      }
+
+      // Move "Logistics Request" into Requests tab instead of Tasks tab.
+      const taskApiTasks = pendingApiTasks.filter((t: any) => !isLogisticsRequestActivity(t?.activity));
+      setTasks(taskApiTasks.map(mapApiTaskToUiTask));
+    } catch (e) {
+      console.error('Fetch error:', e);
+      setTasks([]);
+      Alert.alert('Error', 'Unable to load tasks. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
     fetchTasks();
   }, []);
+
+  const onRefresh = async () => {
+    try {
+      setRefreshing(true);
+      await fetchTasks();
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  // Complete task: call backend then mark local task as done on success
+  const handleCompleteTask = async (task: Task) => {
+    const payload = {
+      plan_id: String(task.fieldId ?? ''),
+      date: String(task.time ?? ''),
+      activity: String(task.title ?? task.details ?? ''),
+      farm_id: String(task.location ?? ''),
+      status: 'completed',
+    };
+
+    setLoading(true);
+    try {
+      const res = await fetch(`${BASE_URL}/admin_vehicles/update_task_status`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      const data = await res.json().catch(() => null);
+      if (res.ok && data?.success === true) {
+        // mark task done locally
+        setTasks((prev) => prev.map((t) => (t.id === task.id ? { ...t, status: 'done' } : t)));
+        setModalTask(null);
+        try { Alert.alert('Success', 'Task marked completed.'); } catch (e) { /* ignore */ }
+      } else {
+        console.log('update_task_status failed', res.status, data);
+        Alert.alert('Error', 'Unable to complete task.');
+      }
+    } catch (e) {
+      console.log('update_task_status error', e);
+      Alert.alert('Error', 'Network error completing task.');
+    } finally {
+      setLoading(false);
+    }
+  };
 
   // Helper for colors
   const getStatusColor = (status: string) => status === 'in progress' ? '#3b82f6' : '#6b7280';
@@ -189,7 +310,11 @@ const TasksScreen = () => {
       {loading ? (
         <ActivityIndicator size="large" color="#3b82f6" style={{marginTop: 40}} />
       ) : (
-        <ScrollView contentContainerStyle={{ paddingBottom: 40 }} showsVerticalScrollIndicator={false}>
+        <ScrollView
+          contentContainerStyle={{ paddingBottom: 40 }}
+          showsVerticalScrollIndicator={false}
+          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={["#3b82f6"]} tintColor="#3b82f6" />}
+        >
           <Text style={styles.subHeader}>PENDING TASKS</Text>
 
           {/* MAP SECTION */}
@@ -208,6 +333,7 @@ const TasksScreen = () => {
             </View>
             
             <MapView
+              ref={(r) => { mapRef.current = r; }}
               provider={PROVIDER_GOOGLE}
               style={{ flex: 1, minHeight: mapExpanded ? 400 : 180 }}
               showsUserLocation={!!userLocation}
@@ -222,6 +348,7 @@ const TasksScreen = () => {
                 latitudeDelta: 10,
                 longitudeDelta: 10,
               }}
+              onMapReady={fitMapToPoints}
             >
               {userLocation && (
                 <Marker
@@ -271,22 +398,41 @@ const TasksScreen = () => {
               {/* Top Row: Icon + Title + Priority */}
               <View style={styles.cardHeader}>
                 <View style={[
-                  styles.iconBox, 
-                  task.status === 'in progress' ? { backgroundColor: '#dbeafe' } : { backgroundColor: '#f3f4f6' }
+                  styles.iconBox,
+                  task.status === 'in progress' ? { backgroundColor: '#dbeafe' } : task.status === 'done' ? { backgroundColor: '#ECFDF5' } : { backgroundColor: '#f3f4f6' }
                 ]}>
-                  <Icon 
-                    name={task.icon} 
-                    size={24} 
-                    color={task.status === 'in progress' ? '#2563eb' : '#4b5563'} 
-                  />
+                  {task.status === 'done' ? (
+                    <Icon name="check-circle" size={24} color="#059669" />
+                  ) : (
+                    <Icon 
+                      name={task.icon} 
+                      size={24} 
+                      color={task.status === 'in progress' ? '#2563eb' : '#4b5563'} 
+                    />
+                  )}
                 </View>
+
                 <View style={styles.titleContainer}>
-                  <Text style={styles.taskTitle}>{task.title}</Text>
+                  <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                    <Text style={styles.taskTitle}>{task.title}</Text>
+                    {task.status === 'done' && <View style={styles.doneDot} />}
+                  </View>
                   <Text style={styles.taskSubLoc}>
                     <FeatherIcon name="map-pin" size={10} /> {task.location} • {task.fieldId}
                   </Text>
                 </View>
+
                 <View style={styles.rightHeader}>
+                  {/* Directions */}
+                  <TouchableOpacity
+                    onPress={() => openDirections(task)}
+                    activeOpacity={0.8}
+                    hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                    style={[styles.directionsBtn, !hasValidCoords(task.coords) && styles.directionsBtnDisabled]}
+                  >
+                    <FeatherIcon name="navigation" size={18} color={hasValidCoords(task.coords) ? '#10b981' : '#9ca3af'} />
+                  </TouchableOpacity>
+
                   <View style={[styles.priorityDot, { backgroundColor: getPriorityColor(task.priority) }]} />
                   <FeatherIcon name="chevron-right" size={20} color="#9ca3af" />
                 </View>
@@ -383,7 +529,7 @@ const TasksScreen = () => {
                   <Text style={styles.instructionText}>{modalTask.details}</Text>
                 </View>
 
-                <TouchableOpacity style={styles.completeButton} onPress={() => setModalTask(null)}>
+                <TouchableOpacity style={styles.completeButton} onPress={() => modalTask && handleCompleteTask(modalTask)}>
                   <Text style={styles.completeButtonText}>COMPLETE TASK</Text>
                 </TouchableOpacity>
               </>
@@ -438,6 +584,18 @@ const styles = StyleSheet.create({
   taskTitle: { fontSize: 14, fontWeight: '800', color: '#1F2937', marginBottom: 2 },
   taskSubLoc: { fontSize: 12, color: '#6B7280', fontWeight: '500' },
   rightHeader: { alignItems: 'flex-end', justifyContent: 'space-between', height: 36 },
+  directionsBtn: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    marginBottom: 6,
+  },
+  directionsBtnDisabled: { opacity: 0.7 },
   priorityDot: { width: 8, height: 8, borderRadius: 4, marginBottom: 8 },
   divider: { height: 1, backgroundColor: '#E5E7EB', marginVertical: 12 },
   
@@ -474,6 +632,7 @@ const styles = StyleSheet.create({
 
   completeButton: { backgroundColor: '#22c55e', paddingVertical: 16, borderRadius: 12, alignItems: 'center' },
   completeButtonText: { color: '#fff', fontSize: 16, fontWeight: '800' },
+  doneDot: { width: 10, height: 10, borderRadius: 5, backgroundColor: '#10B981', marginLeft: 8 },
 });
 
 export default TasksScreen;

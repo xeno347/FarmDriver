@@ -1,9 +1,10 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
-    
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- Required for scheduled notifications to survive reboots -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
       android:name=".MainApplication"
@@ -18,6 +19,28 @@
       <meta-data
         android:name="com.google.android.geo.API_KEY"
         android:value="AIzaSyA2xkJ6E-4cqRF2asBbR4mEaC3wbm2P2XA" />
+
+      <!-- react-native-push-notification: default notification channel id for Firebase notifications -->
+      <meta-data android:name="com.google.firebase.messaging.default_notification_channel_id" android:value="farmdriver-requests" />
+
+      <!-- Optional: pre-defined notification channels (res/xml/notification_channels.xml) -->
+      <meta-data android:name="com.dieam.reactnativepushnotification.notification_channels" android:resource="@xml/notification_channels" />
+
+      <!-- PushNotification required service and receivers -->
+      <service android:name="com.dieam.reactnativepushnotification.modules.RNPushNotificationListenerService" android:exported="false">
+        <intent-filter>
+          <action android:name="com.google.firebase.MESSAGING_EVENT" />
+        </intent-filter>
+      </service>
+
+      <receiver android:name="com.dieam.reactnativepushnotification.modules.RNPushNotificationPublisher" android:exported="false" />
+      <receiver android:name="com.dieam.reactnativepushnotification.modules.RNPushNotificationBootEventReceiver" android:exported="false">
+        <intent-filter>
+          <action android:name="android.intent.action.BOOT_COMPLETED" />
+          <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+          <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+        </intent-filter>
+      </receiver>
 
       <activity
         android:name=".MainActivity"
